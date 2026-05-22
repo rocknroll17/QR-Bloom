@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# QR-Bloom: training artifacts and checkpoints
+checkpoints/
+runs/
+runs*/
+samples/
+*.pt
+*.pth
+data/

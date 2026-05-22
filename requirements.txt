@@ -1,0 +1,7 @@
+torch>=2.1
+numpy
+segno
+tqdm
+matplotlib
+fastapi
+uvicorn

@@ -1,0 +1,21 @@
+.git
+.gitignore
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Training artifacts — never baked into the image
+checkpoints/
+runs/
+runs*/
+samples/
+data/
+*.pt
+*.pth
+
+# Not needed at runtime
+assets/
+README.md
+LICENSE
+Dockerfile
+.dockerignore
