@@ -397,7 +397,8 @@ function animate(){
 
   // Reduce rotateSpeed near the top pole to prevent azimuth twisting.
   if (!isTransitioning && MODE === "tree") {
-    turntable += TURNTABLE_SPEED;
+    // Turntable effect disabled
+    // turntable += TURNTABLE_SPEED;
     const v = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
     const polar = Math.acos(Math.max(-1, Math.min(1, v.y)));   // 0 = top, π = bottom
     controls.rotateSpeed = polar < 0.35 ? (0.15 + (polar / 0.35) * 0.85) : 1.0;
