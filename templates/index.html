@@ -1,51 +1,189 @@
 <!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/>
-<title>QR-Bloom Gallery</title>
+<title>QR-Bloom</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-  html, body { margin:0; height:100%; background:#f8fafc; color:#1e293b;
-               font-family:system-ui,Arial,sans-serif; overflow:hidden; }
-  canvas { display:block; }
-  #header {
-    position:fixed; top:0; left:0; right:0; z-index:10;
-    background:linear-gradient(180deg, rgba(248,250,252,0.97), rgba(248,250,252,0.7) 80%, transparent);
-    padding:14px 20px 18px;
+  :root {
+    --bg: #f8fafc;
+    --ink: #0f172a;
+    --ink-soft: #475569;
+    --ink-faint: #94a3b8;
+    --line: #e2e8f0;
+    --line-strong: #cbd5e1;
+    --paper: #ffffff;
+    --accent: #16a34a;
+    --accent-hover: #15803d;
+    --blue: #2563eb;
+    --blue-hover: #1d4ed8;
+    --radius: 14px;
+    --radius-sm: 9px;
   }
-  #title { font-size:14px; font-weight:600; opacity:0.85; margin-bottom:6px; }
-  #urlbar { margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  #url-input { font-size:13px; padding:7px 10px; width:340px;
-               background:#fff; color:#1e293b; border:1px solid #cbd5e1; border-radius:6px; outline:none; }
-  #url-input:focus { border-color:#2563eb; }
-  #url-theme { font-size:12px; padding:6px 8px; background:#fff; color:#1e293b; border:1px solid #cbd5e1; border-radius:5px; }
-  #url-gen { font-size:12px; padding:6px 12px; background:#16a34a; color:#fff; border:1px solid #16a34a; border-radius:5px; cursor:pointer; font-weight:600; }
-  #url-gen:hover { background:#15803d; }
-  #url-gen:disabled { opacity:0.5; cursor:wait; }
-  #copy-embed-btn {
-    font-size:12px; padding:6px 12px; background:#2563eb; color:#fff;
-    border:1px solid #2563eb; border-radius:5px; cursor:pointer; font-weight:600;
-    transition:background 0.15s;
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--ink);
+    font-family: 'Geist', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
   }
-  #copy-embed-btn:hover:not(:disabled) { background:#1d4ed8; }
-  #copy-embed-btn:disabled { opacity:0.45; cursor:not-allowed; }
-  #copy-embed-btn.copied { background:#16a34a; border-color:#16a34a; }
-  #url-status { font-size:11px; opacity:0.7; }
-  #bottom {
-    position:fixed; left:50%; transform:translateX(-50%); bottom:18px; z-index:10;
-    display:flex; gap:10px; padding:10px 14px; align-items:center;
-    background:rgba(255,255,255,0.92); backdrop-filter:blur(10px);
-    border-radius:12px; border:1px solid #e2e8f0;
-    box-shadow:0 8px 30px rgba(15,23,42,0.12);
+  canvas { display: block; }
+
+  /* Brand wordmark — top-left, never blocks interaction. */
+  #brand {
+    position: fixed; top: 18px; left: 22px; z-index: 11;
+    font-size: 15px; font-weight: 600;
+    letter-spacing: -0.015em;
+    color: var(--ink);
+    text-decoration: none;
+    user-select: none;
+    transition: opacity 0.15s;
   }
-  button { font-size:13px; padding:6px 12px; background:#fff; color:#1e293b;
-           border:1px solid #cbd5e1; border-radius:6px; cursor:pointer; outline:none; }
-  button:hover { background:#f1f5f9; }
-  button.active { background:#16a34a; border-color:#16a34a; color:#fff; }
-  #help { position:fixed; left:18px; bottom:18px; font-size:11px; color:#94a3b8;
-          pointer-events:none; }
-  /* ?nohud — clean view: hide all UI overlays (used for captures/embeds). */
-  html.nohud #header, html.nohud #bottom, html.nohud #help {
-    opacity:0; pointer-events:none;
+  #brand:hover { opacity: 0.6; }
+
+  /* Dock — single floating panel that holds every control. */
+  #dock {
+    position: fixed; left: 50%; bottom: 20px;
+    transform: translateX(-50%);
+    z-index: 10;
+    width: min(740px, calc(100% - 28px));
+    padding: 10px;
+    display: flex; flex-direction: column; gap: 8px;
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(18px) saturate(140%);
+    -webkit-backdrop-filter: blur(18px) saturate(140%);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow:
+      0 18px 48px -12px rgba(15, 23, 42, 0.22),
+      0 2px 6px rgba(15, 23, 42, 0.05);
   }
+  .row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+
+  /* Input row */
+  #url-input {
+    flex: 1; min-width: 0;
+    font: inherit; font-size: 13.5px;
+    padding: 10px 13px;
+    background: var(--paper);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  #url-input::placeholder { color: var(--ink-faint); }
+  #url-input:focus {
+    border-color: var(--blue);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
+  }
+  #url-theme {
+    font: inherit; font-size: 13px;
+    padding: 10px 28px 10px 12px;
+    background: var(--paper)
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='none' stroke='%2394a3b8' stroke-width='1.6' stroke-linecap='round' d='M1 1l4 4 4-4'/></svg>")
+      no-repeat right 10px center;
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    cursor: pointer; outline: none;
+    appearance: none; -webkit-appearance: none;
+    max-width: 150px;
+  }
+  #url-theme:focus { border-color: var(--blue); }
+  #url-gen {
+    font: inherit; font-size: 13px; font-weight: 600;
+    padding: 10px 18px;
+    background: var(--accent);
+    color: #fff;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background 0.15s, transform 0.05s;
+    white-space: nowrap;
+  }
+  #url-gen:hover:not(:disabled) { background: var(--accent-hover); }
+  #url-gen:active:not(:disabled) { transform: translateY(1px); }
+  #url-gen:disabled { opacity: 0.55; cursor: wait; }
+
+  /* Controls row — divider sits between the two rows. */
+  .row.controls {
+    padding: 8px 2px 2px;
+    border-top: 1px dashed var(--line);
+  }
+  #mode-toggle {
+    font: inherit; font-size: 12.5px; font-weight: 600;
+    padding: 7px 14px;
+    background: var(--ink);
+    color: #fff;
+    border: 1px solid var(--ink);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: opacity 0.15s;
+    min-width: 58px;
+    letter-spacing: 0.02em;
+  }
+  #mode-toggle:hover { opacity: 0.86; }
+
+  .tool {
+    font: inherit; font-size: 12.5px; font-weight: 500;
+    padding: 7px 13px;
+    background: var(--paper);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .tool:hover:not(:disabled) {
+    background: #f1f5f9;
+    border-color: var(--line-strong);
+  }
+  .tool:disabled { opacity: 0.4; cursor: not-allowed; }
+  #copy-embed-btn.copied {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+
+  #url-status {
+    font-family: 'Geist Mono', ui-monospace, SFMono-Regular, monospace;
+    font-size: 11px;
+    color: var(--ink-faint);
+    margin-left: auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding-left: 4px;
+  }
+
+  /* Mobile layout */
+  @media (max-width: 640px) {
+    #brand { top: 14px; left: 16px; font-size: 14px; }
+    #dock {
+      bottom: 12px;
+      width: calc(100% - 20px);
+      padding: 9px;
+      border-radius: 13px;
+    }
+    .row { flex-wrap: wrap; gap: 7px; }
+    #url-input { flex: 1 1 100%; font-size: 16px; padding: 11px 13px; }
+    #url-theme { flex: 1 1 auto; max-width: none; }
+    #url-gen { flex: 1 1 auto; }
+    .row.controls { gap: 6px; }
+    #url-status {
+      flex: 1 1 100%;
+      margin-left: 0;
+      text-align: right;
+      padding-top: 4px;
+    }
+  }
+
+  /* ?nohud — clean view used for captures/embeds. */
+  html.nohud #brand, html.nohud #dock { opacity: 0; pointer-events: none; }
 </style>
 <script>
   // ?nohud — apply the clean view before the body parses, so no post-load
@@ -54,24 +192,23 @@
     document.documentElement.classList.add('nohud');
 </script>
 </head><body>
-<div id="header">
-  <div id="title">QR-Bloom Gallery</div>
-  <div id="urlbar">
-    <input id="url-input" type="text" placeholder="URL or text (version-1 QR) — press Enter to generate"
+<a id="brand" href="/">QR-Bloom</a>
+
+<div id="dock">
+  <div class="row">
+    <input id="url-input" type="text"
+           placeholder="Paste a link or short text, then press Enter"
            spellcheck="false" autocomplete="off"/>
-    <select id="url-theme"></select>
+    <select id="url-theme" aria-label="Theme"></select>
     <button id="url-gen">Generate</button>
-    <button id="copy-embed-btn" disabled>Copy embed HTML</button>
+  </div>
+  <div class="row controls">
+    <button id="mode-toggle">3D</button>
+    <button id="snap" class="tool">Save PNG</button>
+    <button id="copy-embed-btn" class="tool" disabled>Copy embed</button>
     <span id="url-status"></span>
   </div>
 </div>
-
-<div id="bottom">
-  <button id="mode-toggle" class="active">3D</button>
-  <button id="snap">PNG</button>
-</div>
-
-<div id="help">drag · scroll · right-drag</div>
 
 <script type="importmap">
 { "imports": {
@@ -323,7 +460,7 @@ copyEmbedBtn.onclick = () => {
       copyEmbedBtn.textContent = 'Copied!';
       copyEmbedBtn.classList.add('copied');
       setTimeout(() => {
-        copyEmbedBtn.textContent = 'Copy embed HTML';
+        copyEmbedBtn.textContent = 'Copy embed';
         copyEmbedBtn.classList.remove('copied');
       }, 2200);
     })
