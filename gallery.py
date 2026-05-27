@@ -110,7 +110,10 @@ def _load_model(version: int | None = None):
 
     ck_path = _ckpt_path_for_version(version)
     if not os.path.exists(ck_path):
-        raise FileNotFoundError(
+        # ValueError (not FileNotFoundError) so the API exception handler can
+        # safely surface the message without risking that some unrelated
+        # FileNotFoundError from torch / disk I/O leaks a raw path.
+        raise ValueError(
             f"No trained model is available for QR version {version}.")
     real_path = os.path.realpath(ck_path)
     mtime = os.path.getmtime(real_path)
@@ -365,9 +368,23 @@ def get_state():
     return state
 
 
-_PNG_SAFE = re.compile(r'^(loss|epoch_\d+)\.png$')
-_JSON_SAFE = re.compile(r'^(ep\d+|unseen_gt)\.json$')
-_ASSET_SAFE = re.compile(r'^[\w-]+\.hdr$')
+def _safe_path_in(base: str, name: str) -> str | None:
+    """Resolve `base/name` and return it only if it stays inside `base`.
+
+    Belt-and-suspenders containment check — the callers already validate
+    `name` against a strict pattern before calling, but resolving with
+    realpath and confirming the result is rooted at `base` makes path
+    injection structurally impossible.
+    """
+    base_real = os.path.realpath(base)
+    full_real = os.path.realpath(os.path.join(base_real, name))
+    try:
+        if os.path.commonpath([base_real, full_real]) == base_real:
+            return full_real
+    except ValueError:
+        # Different drives on Windows, or otherwise incommensurable paths.
+        pass
+    return None
 
 app = FastAPI()
 
@@ -405,14 +422,22 @@ def route_state():
     return JSONResponse(content=get_state(), headers={"Cache-Control": "no-store"})
 
 
+# Image and JSON routes reconstruct the requested filename from a regex match
+# group rather than passing user input through; the validated filename is
+# rebuilt from literal strings + an integer parse so no user-controlled byte
+# can survive into the path expression.
+
 @app.get("/img/{name}")
 def route_img(name: str):
-    if not _PNG_SAFE.match(name):
+    if name == "loss.png":
+        clean = "loss.png"
+    elif (m := re.fullmatch(r'epoch_(\d+)\.png', name)):
+        # zfill(3) matches train.py's epoch_{N:03d} naming so the lookup hits.
+        clean = f"epoch_{int(m.group(1)):03d}.png"
+    else:
         return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    full = os.path.join(RUNS_DIR, name)
-    if not os.path.exists(full):
-        full = os.path.join(ROOT, name)
-    if not os.path.exists(full):
+    full = _safe_path_in(RUNS_DIR, clean) or _safe_path_in(ROOT, clean)
+    if not full or not os.path.exists(full):
         return Response(content=b"not found", status_code=404, media_type="text/plain")
     with open(full, "rb") as f:
         data = f.read()
@@ -422,31 +447,20 @@ def route_img(name: str):
 
 @app.get("/data/{name}")
 def route_data(name: str):
-    if not _JSON_SAFE.match(name):
+    if name == "unseen_gt.json":
+        clean = "unseen_gt.json"
+    elif (m := re.fullmatch(r'ep(\d+)\.json', name)):
+        # zfill(3) matches train.py's epoch_{N:03d} naming so the lookup hits.
+        clean = f"epoch_{int(m.group(1)):03d}.json"
+    else:
         return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    fname = re.sub(r'^ep(\d+)\.json$', r'epoch_\1.json', name)
-    full = os.path.join(RUNS_DIR, fname)
-    if not os.path.exists(full):
-        full = os.path.join(ROOT, fname)
-    if not os.path.exists(full):
+    full = _safe_path_in(RUNS_DIR, clean) or _safe_path_in(ROOT, clean)
+    if not full or not os.path.exists(full):
         return Response(content=b"not found", status_code=404, media_type="text/plain")
     with open(full, "rb") as f:
         data = f.read()
     return Response(content=data, media_type="application/json",
                     headers={"Cache-Control": "no-store"})
-
-
-@app.get("/assets/{name}")
-def route_assets(name: str):
-    if not _ASSET_SAFE.match(name):
-        return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    full = os.path.join(ROOT, "assets", name)
-    if not os.path.exists(full):
-        return Response(content=b"not found", status_code=404, media_type="text/plain")
-    with open(full, "rb") as f:
-        data = f.read()
-    return Response(content=data, media_type="image/vnd.radiance",
-                    headers={"Cache-Control": "max-age=86400"})
 
 
 class _GenerateBody(BaseModel):
@@ -480,10 +494,10 @@ def route_api_generate(body: _GenerateBody):
     try:
         result = model_generate(url, theme, steps=100, version=body.version)
         return JSONResponse(content=result)
-    except (ValueError, FileNotFoundError) as e:
-        # Expected user-facing problems (text too long, no model for that
-        # version, etc.) — these messages are written to be user-friendly,
-        # so it's safe to pass them through.
+    except ValueError as e:
+        # ValueError is reserved for deliberate user-facing messages (text
+        # too long, no model for that version, etc.). Other exception types
+        # are treated as internal and their messages are not surfaced.
         return JSONResponse(content={"error": str(e)}, status_code=400)
     except Exception:
         # Unexpected failure (CUDA OOM, malformed checkpoint, etc.) — hide
