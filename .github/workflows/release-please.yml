@@ -23,6 +23,10 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Use a personal access token so the tag push the action makes can
+          # trigger downstream workflows (release.yml). Tag pushes made with
+          # the default GITHUB_TOKEN do not trigger other workflows by design,
+          # which would otherwise leave new versions without a Docker image.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
