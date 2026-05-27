@@ -92,7 +92,7 @@ def _th_bn(theme, scale_xy, scale_z):
         "willow":         (fl(7 * scale_z) + fl(3 * scale_z), fl(10 * scale_xy)),
         "magnolia":       (fl(7 * scale_z), fl(10 * scale_xy)),
         "saguaro_cactus": (1, fl(10 * scale_xy)),
-        "palm":           (fl(13 * scale_z), fl(12 * scale_xy)),
+        "palm":           (fl(11 * scale_z), fl(12 * scale_xy)),
         "acacia":         (fl(9 * scale_z), fl(10 * scale_xy)),
     }
     return table[theme]
@@ -113,23 +113,6 @@ def _hash(x, y, z):
     """Deterministic hash noise in [0, 1] — shader idiom fract(sin(dot)*k). Used for scattering leaves."""
     v = np.sin(x * 12.9898 + y * 78.233 + z * 37.719) * 43758.5453
     return v - np.floor(v)
-
-
-def _truncated_normal(npr, lo, hi, max_tries=20):
-    """Truncated normal in [lo, hi] via rejection sampling.
-
-    mean = midpoint, std = range/4 so ~95% of N(mean, std) already lies
-    inside [lo, hi] (rejection rate ~5%, ~1 try on average). Most samples
-    cluster near the canonical species shape; extremes are rare. Falls
-    back to clipping after max_tries to guarantee termination.
-    """
-    mid = 0.5 * (lo + hi)
-    std = max(1e-9, (hi - lo) / 4.0)
-    for _ in range(max_tries):
-        v = float(npr.normal(mid, std))
-        if lo <= v <= hi:
-            return v
-    return float(np.clip(npr.normal(mid, std), lo, hi))
 
 
 def _seg_dist_field(x, z, y, p0, p1):
@@ -370,16 +353,9 @@ def _palm(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
     taller crowns) but the drooping term is intentionally damped — at large
     sc both terms scaled together made the fronds plunge way below the
     trunk top, which looks like sagging tentacles rather than palm leaves.
-
-    Trunk radius is deliberately decoupled from `sc`: real palm trunks stay
-    slender even as the tree gets taller. We only nudge it up a touch at
-    larger versions so the cross-section doesn't look one-voxel-thin
-    against a much wider canopy. A per-tree truncated-normal multiplier
-    `tm` gives small individual variation without making any palm chunky.
     """
     e, H = x.shape[0], y.shape[1]
-    tm = _truncated_normal(npr, 0.88, 1.12)
-    trunk_r = (1.6 + 0.3 * max(0.0, sc - 1.0)) * tm
+    trunk_r = 1.9 * sc
     rxz = np.sqrt(x ** 2 + z ** 2)
     trunk = (y >= 0) & (y <= th) & (rxz <= trunk_r)
 
@@ -476,18 +452,15 @@ def build_tree(theme, e, H, npr, augment=True):
     scale_xy = max(1.0, e / 21.0)
     scale_z = scale_xy * 1.25
 
-    # --- augmentation: jitter radius, trunk height, density, and
-    # coordinate salt within per-species ranges. Uses truncated-normal
-    # sampling (mean at midpoint, std = range/4) so most trees cluster
-    # near the species canonical shape; extreme jitter is rare.
+    # --- augmentation: jitter radius, trunk height, density, and coordinate salt within per-species ranges ---
     h_lo, h_hi, r_lo, r_hi, d_lo, d_hi, salt = _aug_range(theme)
     if augment:
-        hm = _truncated_normal(npr, h_lo, h_hi)
-        rm = _truncated_normal(npr, r_lo, r_hi)
-        dm = _truncated_normal(npr, d_lo, d_hi)
-        sx = int(round(_truncated_normal(npr, -salt, salt))) if salt else 0
-        sy = int(round(_truncated_normal(npr, -salt, salt))) if salt else 0
-        sz = int(round(_truncated_normal(npr, -salt, salt))) if salt else 0
+        hm = h_lo + (h_hi - h_lo) * npr.random()
+        rm = r_lo + (r_hi - r_lo) * npr.random()
+        dm = d_lo + (d_hi - d_lo) * npr.random()
+        sx = int(round((npr.random() - 0.5) * 2 * salt))
+        sy = int(round((npr.random() - 0.5) * 2 * salt))
+        sz = int(round((npr.random() - 0.5) * 2 * salt))
     else:
         hm = rm = dm = 1.0
         sx = sy = sz = 0
