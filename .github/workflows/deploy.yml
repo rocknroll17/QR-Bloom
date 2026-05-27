@@ -48,7 +48,20 @@ jobs:
             CHECKPOINTS="${{ secrets.DEPLOY_CHECKPOINTS_DIR }}"
 
             echo "==> Pulling ${IMAGE}"
-            docker pull "${IMAGE}"
+            # release.yml fires on the same tag push and races us. If the
+            # image isn't on GHCR yet (manifest unknown), retry for up to a
+            # few minutes before giving up.
+            for i in 1 2 3 4 5 6 7 8; do
+              if docker pull "${IMAGE}"; then
+                break
+              fi
+              if [ "$i" = "8" ]; then
+                echo "ERROR: image ${IMAGE} still not available after $((i * 15))s; aborting."
+                exit 1
+              fi
+              echo "image not available yet, retrying in 15s (attempt $i/8)..."
+              sleep 15
+            done
 
             echo "==> Stopping existing qrbloom-gallery (if any)"
             docker rm -f qrbloom-gallery 2>/dev/null || true
