@@ -368,23 +368,22 @@ def get_state():
     return state
 
 
-_PNG_SAFE = re.compile(r'^(loss|epoch_\d+)\.png$')
-_JSON_SAFE = re.compile(r'^(ep\d+|unseen_gt)\.json$')
-_ASSET_SAFE = re.compile(r'^[\w-]+\.hdr$')
-
-
 def _safe_path_in(base: str, name: str) -> str | None:
     """Resolve `base/name` and return it only if it stays inside `base`.
 
-    Defense in depth: the regex allowlists above already reject path
-    separators, but resolving + containment-checking makes path injection
-    impossible regardless of any future relaxation, and satisfies static
-    analyzers that don't recognize regex-based sanitization.
+    Belt-and-suspenders containment check — the callers already validate
+    `name` against a strict pattern before calling, but resolving with
+    realpath and confirming the result is rooted at `base` makes path
+    injection structurally impossible.
     """
     base_real = os.path.realpath(base)
     full_real = os.path.realpath(os.path.join(base_real, name))
-    if full_real == base_real or full_real.startswith(base_real + os.sep):
-        return full_real
+    try:
+        if os.path.commonpath([base_real, full_real]) == base_real:
+            return full_real
+    except ValueError:
+        # Different drives on Windows, or otherwise incommensurable paths.
+        pass
     return None
 
 app = FastAPI()
@@ -423,11 +422,21 @@ def route_state():
     return JSONResponse(content=get_state(), headers={"Cache-Control": "no-store"})
 
 
+# Image and JSON routes reconstruct the requested filename from a regex match
+# group rather than passing user input through; the validated filename is
+# rebuilt from literal strings + an integer parse so no user-controlled byte
+# can survive into the path expression.
+
 @app.get("/img/{name}")
 def route_img(name: str):
-    if not _PNG_SAFE.match(name):
+    if name == "loss.png":
+        clean = "loss.png"
+    elif (m := re.fullmatch(r'epoch_(\d+)\.png', name)):
+        # zfill(3) matches train.py's epoch_{N:03d} naming so the lookup hits.
+        clean = f"epoch_{int(m.group(1)):03d}.png"
+    else:
         return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    full = _safe_path_in(RUNS_DIR, name) or _safe_path_in(ROOT, name)
+    full = _safe_path_in(RUNS_DIR, clean) or _safe_path_in(ROOT, clean)
     if not full or not os.path.exists(full):
         return Response(content=b"not found", status_code=404, media_type="text/plain")
     with open(full, "rb") as f:
@@ -438,29 +447,20 @@ def route_img(name: str):
 
 @app.get("/data/{name}")
 def route_data(name: str):
-    if not _JSON_SAFE.match(name):
+    if name == "unseen_gt.json":
+        clean = "unseen_gt.json"
+    elif (m := re.fullmatch(r'ep(\d+)\.json', name)):
+        # zfill(3) matches train.py's epoch_{N:03d} naming so the lookup hits.
+        clean = f"epoch_{int(m.group(1)):03d}.json"
+    else:
         return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    fname = re.sub(r'^ep(\d+)\.json$', r'epoch_\1.json', name)
-    full = _safe_path_in(RUNS_DIR, fname) or _safe_path_in(ROOT, fname)
+    full = _safe_path_in(RUNS_DIR, clean) or _safe_path_in(ROOT, clean)
     if not full or not os.path.exists(full):
         return Response(content=b"not found", status_code=404, media_type="text/plain")
     with open(full, "rb") as f:
         data = f.read()
     return Response(content=data, media_type="application/json",
                     headers={"Cache-Control": "no-store"})
-
-
-@app.get("/assets/{name}")
-def route_assets(name: str):
-    if not _ASSET_SAFE.match(name):
-        return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    full = _safe_path_in(os.path.join(ROOT, "assets"), name)
-    if not full or not os.path.exists(full):
-        return Response(content=b"not found", status_code=404, media_type="text/plain")
-    with open(full, "rb") as f:
-        data = f.read()
-    return Response(content=data, media_type="image/vnd.radiance",
-                    headers={"Cache-Control": "max-age=86400"})
 
 
 class _GenerateBody(BaseModel):
