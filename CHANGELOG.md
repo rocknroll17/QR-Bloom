@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.6](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.5...v1.1.6) (2026-05-27)
+
+
+### Bug Fixes
+
+* **docker:** ship the docs/ directory in the image ([#27](https://github.com/rocknroll17/QR-Bloom/issues/27)) ([290a84d](https://github.com/rocknroll17/QR-Bloom/commit/290a84d826873c3879926ceb5541df67a6d59203))
+
 ## [1.1.5](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.4...v1.1.5) (2026-05-27)
 
 
