@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.4](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.3...v1.1.4) (2026-05-27)
+
+
+### Documentation
+
+* distinguish trained-model demo from procedural preview ([#20](https://github.com/rocknroll17/QR-Bloom/issues/20)) ([43dc46e](https://github.com/rocknroll17/QR-Bloom/commit/43dc46e20ff13d48e35d915b2d06ac16bbcfcb63))
+
 ## [1.1.3](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.2...v1.1.3) (2026-05-27)
 
 
