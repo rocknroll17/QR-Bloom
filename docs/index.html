@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<title>QR-Bloom — live demo</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta property="og:title" content="QR-Bloom"/>
+<meta property="og:description" content="A 3D voxel tree whose top-down silhouette is a scannable QR code."/>
+<style>
+  :root {
+    --bg: #f8fafc;
+    --ink: #0f172a;
+    --ink-soft: #475569;
+    --ink-faint: #94a3b8;
+    --line: #e2e8f0;
+    --paper: #ffffff;
+    --accent: #16a34a;
+    --blue: #2563eb;
+    --radius: 14px;
+    --radius-sm: 9px;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+  canvas { display: block; }
+
+  /* Header — wordmark + tagline + repo link. */
+  #header {
+    position: fixed; top: 18px; left: 22px; z-index: 11;
+    display: flex; flex-direction: column; gap: 2px;
+    user-select: none;
+  }
+  #brand {
+    font-size: 15px; font-weight: 600;
+    letter-spacing: -0.015em;
+    color: var(--ink);
+    text-decoration: none;
+  }
+  #tagline {
+    font-size: 12px; color: var(--ink-soft);
+    max-width: 320px;
+    line-height: 1.4;
+  }
+  #repo-link {
+    position: fixed; top: 18px; right: 22px; z-index: 11;
+    font-size: 12.5px; font-weight: 500;
+    color: var(--ink-soft);
+    text-decoration: none;
+    padding: 7px 12px;
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(18px);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    transition: color 0.15s;
+  }
+  #repo-link:hover { color: var(--ink); }
+
+  /* Dock — floating control panel at the bottom. */
+  #dock {
+    position: fixed; left: 50%; bottom: 20px;
+    transform: translateX(-50%);
+    z-index: 10;
+    width: min(640px, calc(100% - 28px));
+    padding: 10px;
+    display: flex; align-items: center; gap: 8px;
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(18px) saturate(140%);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow:
+      0 18px 48px -12px rgba(15, 23, 42, 0.22),
+      0 2px 6px rgba(15, 23, 42, 0.05);
+  }
+  #theme-select {
+    flex: 1; min-width: 0;
+    font: inherit; font-size: 13.5px;
+    padding: 10px 28px 10px 13px;
+    background: var(--paper)
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='none' stroke='%2394a3b8' stroke-width='1.6' stroke-linecap='round' d='M1 1l4 4 4-4'/></svg>")
+      no-repeat right 10px center;
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    cursor: pointer; outline: none;
+    appearance: none; -webkit-appearance: none;
+  }
+  #theme-select:focus { border-color: var(--blue); }
+  .view-btn {
+    font: inherit; font-size: 13px; font-weight: 500;
+    padding: 10px 14px;
+    background: var(--paper);
+    color: var(--ink-soft);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .view-btn:hover { color: var(--ink); border-color: var(--ink-faint); }
+  .view-btn.active {
+    color: #fff; background: var(--ink);
+    border-color: var(--ink);
+  }
+
+  /* Info chip — bottom-left, shows current sample text/version. */
+  #info {
+    position: fixed; left: 22px; bottom: 22px; z-index: 9;
+    font-size: 12px; color: var(--ink-soft);
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(18px);
+    padding: 8px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+  }
+  #info code {
+    font-size: 12px;
+    background: var(--bg);
+    padding: 1px 6px;
+    border-radius: 4px;
+    color: var(--ink);
+  }
+
+  @media (max-width: 600px) {
+    #header { top: 14px; left: 16px; }
+    #repo-link { top: 14px; right: 16px; }
+    #tagline { display: none; }
+    #info { left: 16px; bottom: auto; top: 64px; }
+  }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <span id="brand">QR-Bloom</span>
+  <span id="tagline">A 3D voxel tree whose top-down silhouette is a scannable QR code.</span>
+</div>
+<a id="repo-link" href="https://github.com/rocknroll17/QR-Bloom" target="_blank" rel="noopener">GitHub →</a>
+
+<div id="dock">
+  <select id="theme-select" aria-label="Tree theme"></select>
+  <button class="view-btn active" id="view-tree" type="button">Tree</button>
+  <button class="view-btn" id="view-qr" type="button">QR</button>
+</div>
+
+<div id="info">
+  <span id="info-label">Loading…</span>
+  &nbsp;·&nbsp;
+  <code id="info-text">—</code>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+// Camera presets (from CLAUDE.md — keep consistent with the gallery).
+const TARGETS = {
+  tree: { pos: [45, 20, 45], target: [0, 14, 0], up: [0, 1, 0], halfSize: 24 },
+  qr:   { pos: [0, 100, 0],  target: [0, 0, 0],  up: [0, 0, -1], halfSize: 16.5 },
+};
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xf8fafc);
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+pmrem.compileEquirectangularShader();
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+let aspect = window.innerWidth / window.innerHeight;
+let half = TARGETS.tree.halfSize;
+const camera = new THREE.OrthographicCamera(
+  -half * aspect, half * aspect, half, -half, 0.1, 500
+);
+camera.position.set(...TARGETS.tree.pos);
+camera.lookAt(...TARGETS.tree.target);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(...TARGETS.tree.target);
+controls.enablePan = false;
+
+const amb = new THREE.AmbientLight(0xffffff, 0.6);
+scene.add(amb);
+const dir = new THREE.DirectionalLight(0xffffff, 1.2);
+dir.position.set(20, 30, 20);
+dir.castShadow = true;
+dir.shadow.mapSize.set(1024, 1024);
+dir.shadow.camera.left = -40; dir.shadow.camera.right = 40;
+dir.shadow.camera.top = 40; dir.shadow.camera.bottom = -40;
+dir.shadow.camera.near = 1; dir.shadow.camera.far = 100;
+dir.shadow.bias = -0.0002; dir.shadow.normalBias = 0.02;
+scene.add(dir);
+
+const geo = new THREE.BoxGeometry(1, 1, 1);
+let meshes = [];
+
+function clearMeshes() {
+  for (const m of meshes) {
+    scene.remove(m);
+    m.geometry?.dispose?.();
+    m.material?.dispose?.();
+  }
+  meshes = [];
+}
+
+// Build InstancedMesh per (color, scale, isBase) so the QR base and the tree
+// shadow correctly while colors stay efficient.
+function buildScene(cells) {
+  clearMeshes();
+  const byKey = new Map();
+  for (const [x, y, z, scale, color] of cells) {
+    const isBase = (y === 0);
+    const key = `${color}|${scale}|${isBase ? 1 : 0}`;
+    if (!byKey.has(key)) byKey.set(key, { color, scale, isBase, positions: [] });
+    byKey.get(key).positions.push([x, y, z]);
+  }
+  const M = new THREE.Matrix4();
+  const Q = new THREE.Quaternion();
+  const P = new THREE.Vector3();
+  for (const { color, scale, isBase, positions } of byKey.values()) {
+    const mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(color), roughness: 0.9, metalness: 0.0,
+    });
+    const mesh = new THREE.InstancedMesh(geo, mat, positions.length);
+    // Tree voxels cast; base receives. Both render visibly.
+    mesh.castShadow = !isBase;
+    mesh.receiveShadow = true;
+    const S = new THREE.Vector3(scale, scale, scale);
+    for (let i = 0; i < positions.length; i++) {
+      P.set(positions[i][0], positions[i][1], positions[i][2]);
+      M.compose(P, Q, S);
+      mesh.setMatrixAt(i, M);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    scene.add(mesh);
+    meshes.push(mesh);
+  }
+}
+
+// Tween between camera presets.
+let lerping = false;
+const cameraStart = { pos: new THREE.Vector3(), target: new THREE.Vector3() };
+const cameraEnd = { pos: new THREE.Vector3(), target: new THREE.Vector3() };
+let cameraT = 0;
+
+function setView(mode) {
+  const t = TARGETS[mode];
+  cameraStart.pos.copy(camera.position);
+  cameraStart.target.copy(controls.target);
+  cameraEnd.pos.set(...t.pos);
+  cameraEnd.target.set(...t.target);
+  camera.up.set(...t.up);
+  half = t.halfSize;
+  cameraT = 0;
+  lerping = true;
+  document.querySelectorAll('.view-btn').forEach(b => b.classList.toggle(
+    'active', b.id === (mode === 'tree' ? 'view-tree' : 'view-qr')
+  ));
+}
+
+document.getElementById('view-tree').addEventListener('click', () => setView('tree'));
+document.getElementById('view-qr').addEventListener('click', () => setView('qr'));
+
+function onResize() {
+  aspect = window.innerWidth / window.innerHeight;
+  camera.left = -half * aspect; camera.right = half * aspect;
+  camera.top = half; camera.bottom = -half;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+window.addEventListener('resize', onResize);
+
+function animate() {
+  requestAnimationFrame(animate);
+  if (lerping) {
+    cameraT = Math.min(1, cameraT + 0.04);
+    const k = 1 - Math.pow(1 - cameraT, 3);   // ease-out cubic
+    camera.position.lerpVectors(cameraStart.pos, cameraEnd.pos, k);
+    controls.target.lerpVectors(cameraStart.target, cameraEnd.target, k);
+    onResize();
+    if (cameraT >= 1) lerping = false;
+  }
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+// --- Data loading ----------------------------------------------------------
+
+async function loadManifest() {
+  const r = await fetch('samples/manifest.json', { cache: 'no-cache' });
+  if (!r.ok) throw new Error(`manifest fetch failed: ${r.status}`);
+  return r.json();
+}
+
+async function loadSample(file) {
+  const r = await fetch(file, { cache: 'no-cache' });
+  if (!r.ok) throw new Error(`sample fetch failed: ${r.status}`);
+  return r.json();
+}
+
+const select = document.getElementById('theme-select');
+const infoLabel = document.getElementById('info-label');
+const infoText = document.getElementById('info-text');
+
+async function showSample(file, label) {
+  const data = await loadSample(file);
+  buildScene(data.cells);
+  infoLabel.textContent = label;
+  infoText.textContent = data.text;
+}
+
+(async () => {
+  try {
+    const manifest = await loadManifest();
+    for (const t of manifest.themes) {
+      const opt = document.createElement('option');
+      opt.value = t.file;
+      opt.textContent = t.label;
+      opt.dataset.label = t.label;
+      select.appendChild(opt);
+    }
+    select.addEventListener('change', () => {
+      const opt = select.options[select.selectedIndex];
+      showSample(opt.value, opt.dataset.label);
+    });
+    if (manifest.themes.length > 0) {
+      const t0 = manifest.themes[0];
+      await showSample(t0.file, t0.label);
+    }
+  } catch (e) {
+    infoLabel.textContent = 'Failed to load samples';
+    infoText.textContent = e.message;
+    console.error(e);
+  }
+})();
+</script>
+</body></html>

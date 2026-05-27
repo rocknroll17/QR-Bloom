@@ -4,6 +4,9 @@ A QR-conditioned 3D voxel diffusion model. It grows a 3D voxel tree whose
 top-down silhouette is a scannable QR code: viewed from the side it is a tree,
 viewed from above it is a working QR code.
 
+**[Live demo →](https://rocknroll17.github.io/QR-Bloom/)** — pick a theme,
+orbit the tree, then switch to the top-down view to scan the QR.
+
 ![demo](assets/demo.gif)
 
 ## Overview
