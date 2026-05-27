@@ -60,17 +60,37 @@ jobs:
             done
 
             echo "==> Starting new container from ${IMAGE}"
+            # Log rotation caps container logs at ~30MB (3 files × 10MB) so
+            # disk usage stays bounded under heavy traffic.
             docker run -d \
               --name qrbloom-gallery \
               --restart unless-stopped \
               --gpus all \
               -p 8001:8000 \
               -v "${CHECKPOINTS}:/app/checkpoints:ro" \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
               "${IMAGE}"
 
-            echo "==> Cleaning up dangling images"
-            docker image prune -f >/dev/null
+            echo "==> Removing old qr-bloom images (keep only the one in use)"
+            # Find the image id the new container is using, then remove any
+            # other ghcr.io/rocknroll17/qr-bloom image. Scoped strictly to
+            # that repository so other images on this host — including any
+            # locally-built qrbloom variants, dangling layers from unrelated
+            # projects, etc. — are never touched.
+            KEEP_ID=$(docker inspect --format '{{.Image}}' qrbloom-gallery | sed 's/^sha256://')
+            for id in $(docker images "ghcr.io/rocknroll17/qr-bloom" -q | sort -u); do
+              if [ "$id" != "$KEEP_ID" ]; then
+                # docker rmi only releases layers that are no longer referenced
+                # by any other image, so shared base layers (python:3.x-slim,
+                # libgomp1, etc.) stay intact for everything else on the host.
+                docker rmi "$id" 2>/dev/null || true
+              fi
+            done
 
             echo "==> Status"
             docker ps --filter name=qrbloom-gallery \
               --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+            echo "==> Disk used by docker"
+            docker system df
