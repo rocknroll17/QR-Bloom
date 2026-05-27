@@ -159,181 +159,39 @@
 </script>
 
 <script type="module">
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { Viewer } from './qrbloom-viewer.js';
 
-// Camera presets (keep consistent with the gallery template).
-const TARGETS = {
-  tree: { pos: [45, 20, 45], target: [0, 14, 0], up: [0, 1, 0], halfSize: 24 },
-  qr:   { pos: [0, 100, 0],  target: [0, 0, 0],  up: [0, 0, -1], halfSize: 16.5 },
-};
-
-const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.0;
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-document.body.appendChild(renderer.domElement);
-
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xf8fafc);
-
-const pmrem = new THREE.PMREMGenerator(renderer);
-pmrem.compileEquirectangularShader();
-scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-
-let aspect = window.innerWidth / window.innerHeight;
-let half = TARGETS.tree.halfSize;
-const camera = new THREE.OrthographicCamera(
-  -half * aspect, half * aspect, half, -half, 0.1, 500
-);
-camera.position.set(...TARGETS.tree.pos);
-camera.lookAt(...TARGETS.tree.target);
-
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.08;
-controls.target.set(...TARGETS.tree.target);
-controls.enablePan = false;
-
-const amb = new THREE.AmbientLight(0xffffff, 0.6);
-scene.add(amb);
-const dir = new THREE.DirectionalLight(0xffffff, 1.2);
-dir.position.set(20, 30, 20);
-dir.castShadow = true;
-dir.shadow.mapSize.set(1024, 1024);
-dir.shadow.camera.left = -40; dir.shadow.camera.right = 40;
-dir.shadow.camera.top = 40; dir.shadow.camera.bottom = -40;
-dir.shadow.camera.near = 1; dir.shadow.camera.far = 100;
-dir.shadow.bias = -0.0002; dir.shadow.normalBias = 0.02;
-scene.add(dir);
-
-const geo = new THREE.BoxGeometry(1, 1, 1);
-let meshes = [];
-
-function clearMeshes() {
-  for (const m of meshes) {
-    scene.remove(m);
-    m.geometry?.dispose?.();
-    m.material?.dispose?.();
-  }
-  meshes = [];
-}
-
-// Build InstancedMesh per (color, scale, isBase) so the QR base and the tree
-// shadow correctly while colors stay efficient.
-function buildScene(cells) {
-  clearMeshes();
-  const byKey = new Map();
-  for (const [x, y, z, scale, color] of cells) {
-    const isBase = (y === 0);
-    const key = `${color}|${scale}|${isBase ? 1 : 0}`;
-    if (!byKey.has(key)) byKey.set(key, { color, scale, isBase, positions: [] });
-    byKey.get(key).positions.push([x, y, z]);
-  }
-  const M = new THREE.Matrix4();
-  const Q = new THREE.Quaternion();
-  const P = new THREE.Vector3();
-  for (const { color, scale, isBase, positions } of byKey.values()) {
-    const mat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(color), roughness: 0.9, metalness: 0.0,
-    });
-    const mesh = new THREE.InstancedMesh(geo, mat, positions.length);
-    // Tree voxels cast; base receives. Both render visibly.
-    mesh.castShadow = !isBase;
-    mesh.receiveShadow = true;
-    const S = new THREE.Vector3(scale, scale, scale);
-    for (let i = 0; i < positions.length; i++) {
-      P.set(positions[i][0], positions[i][1], positions[i][2]);
-      M.compose(P, Q, S);
-      mesh.setMatrixAt(i, M);
-    }
-    mesh.instanceMatrix.needsUpdate = true;
-    scene.add(mesh);
-    meshes.push(mesh);
-  }
-}
-
-// Tween between camera presets.
-let lerping = false;
-const cameraStart = { pos: new THREE.Vector3(), target: new THREE.Vector3() };
-const cameraEnd = { pos: new THREE.Vector3(), target: new THREE.Vector3() };
-let cameraT = 0;
-
-function setView(mode) {
-  const t = TARGETS[mode];
-  cameraStart.pos.copy(camera.position);
-  cameraStart.target.copy(controls.target);
-  cameraEnd.pos.set(...t.pos);
-  cameraEnd.target.set(...t.target);
-  camera.up.set(...t.up);
-  half = t.halfSize;
-  cameraT = 0;
-  lerping = true;
-  document.querySelectorAll('.view-btn').forEach(b => b.classList.toggle(
-    'active', b.id === (mode === 'tree' ? 'view-tree' : 'view-qr')
-  ));
-}
-
-document.getElementById('view-tree').addEventListener('click', () => setView('tree'));
-document.getElementById('view-qr').addEventListener('click', () => setView('qr'));
-
-function onResize() {
-  aspect = window.innerWidth / window.innerHeight;
-  camera.left = -half * aspect; camera.right = half * aspect;
-  camera.top = half; camera.bottom = -half;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-}
-window.addEventListener('resize', onResize);
-
-function animate() {
-  requestAnimationFrame(animate);
-  if (lerping) {
-    cameraT = Math.min(1, cameraT + 0.04);
-    const k = 1 - Math.pow(1 - cameraT, 3);   // ease-out cubic
-    camera.position.lerpVectors(cameraStart.pos, cameraEnd.pos, k);
-    controls.target.lerpVectors(cameraStart.target, cameraEnd.target, k);
-    onResize();
-    if (cameraT >= 1) lerping = false;
-  }
-  controls.update();
-  renderer.render(scene, camera);
-}
-animate();
-
-// --- Data loading ----------------------------------------------------------
-
-async function loadManifest() {
-  const r = await fetch('samples/manifest.json', { cache: 'no-cache' });
-  if (!r.ok) throw new Error(`manifest fetch failed: ${r.status}`);
-  return r.json();
-}
-
-async function loadSample(file) {
-  const r = await fetch(file, { cache: 'no-cache' });
-  if (!r.ok) throw new Error(`sample fetch failed: ${r.status}`);
-  return r.json();
-}
+const viewer = new Viewer(document.body);
 
 const select = document.getElementById('theme-select');
 const infoLabel = document.getElementById('info-label');
 const infoText = document.getElementById('info-text');
+const viewTree = document.getElementById('view-tree');
+const viewQr = document.getElementById('view-qr');
+
+function setActive(mode) {
+  viewTree.classList.toggle('active', mode === 'tree');
+  viewQr.classList.toggle('active', mode === 'qr');
+}
+viewTree.addEventListener('click', () => { viewer.switchMode('tree'); setActive('tree'); });
+viewQr.addEventListener('click',   () => { viewer.switchMode('qr');   setActive('qr');   });
+
+async function loadJSON(path) {
+  const r = await fetch(path, { cache: 'no-cache' });
+  if (!r.ok) throw new Error(`fetch failed: ${r.status} ${path}`);
+  return r.json();
+}
 
 async function showSample(file, label) {
-  const data = await loadSample(file);
-  buildScene(data.cells);
+  const data = await loadJSON(file);
+  viewer.setCells(data.cells);
   infoLabel.textContent = label;
   infoText.textContent = data.text;
 }
 
 (async () => {
   try {
-    const manifest = await loadManifest();
+    const manifest = await loadJSON('samples/manifest.json');
     for (const t of manifest.themes) {
       const opt = document.createElement('option');
       opt.value = t.file;
@@ -346,8 +204,7 @@ async function showSample(file, label) {
       showSample(opt.value, opt.dataset.label);
     });
     if (manifest.themes.length > 0) {
-      const t0 = manifest.themes[0];
-      await showSample(t0.file, t0.label);
+      await showSample(manifest.themes[0].file, manifest.themes[0].label);
     }
   } catch (e) {
     infoLabel.textContent = 'Failed to load samples';

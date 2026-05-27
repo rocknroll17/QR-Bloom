@@ -388,6 +388,18 @@ def route_embed_template():
     return PlainTextResponse(content=content, headers={"Cache-Control": "no-store"})
 
 
+# Shared 3D viewer — the same file is also published by GitHub Pages, so the
+# gallery and the static demo run identical rendering logic without drift.
+@app.get("/qrbloom-viewer.js")
+def route_viewer_js():
+    content = (Path(ROOT) / "docs" / "qrbloom-viewer.js").read_text(encoding="utf-8")
+    return Response(
+        content=content,
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/state")
 def route_state():
     return JSONResponse(content=get_state(), headers={"Cache-Control": "no-store"})
