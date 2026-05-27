@@ -4,8 +4,9 @@ name: Release
 #   1. Builds the Docker image with semver tags (v1.1.0, 1.1, 1).
 #   2. Creates a GitHub Release with auto-generated notes from PRs / commits.
 #
-# `latest` is intentionally NOT updated here — that's owned by
-# docker-publish.yml on main push, so `latest` always tracks main's tip.
+# `latest` always points to the most recent release (not main's tip), so a
+# user pulling `:latest` gets a tagged, changelog-backed build rather than
+# whatever happened to land last.
 
 on:
   push:
@@ -57,6 +58,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+            type=raw,value=latest
 
       - name: Build and push
         uses: docker/build-push-action@v7
