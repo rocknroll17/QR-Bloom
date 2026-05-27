@@ -42,22 +42,33 @@
   }
   #tagline {
     font-size: 12px; color: var(--ink-soft);
-    max-width: 320px;
+    max-width: 360px;
     line-height: 1.4;
   }
-  #repo-link {
+  #tagline strong { color: var(--ink); font-weight: 600; }
+  #links {
     position: fixed; top: 18px; right: 22px; z-index: 11;
+    display: flex; gap: 8px; align-items: center;
+  }
+  #links a {
     font-size: 12.5px; font-weight: 500;
-    color: var(--ink-soft);
     text-decoration: none;
     padding: 7px 12px;
+    border-radius: var(--radius-sm);
+    transition: opacity 0.15s, background 0.15s;
     background: rgba(255, 255, 255, 0.82);
     backdrop-filter: blur(18px);
     border: 1px solid var(--line);
-    border-radius: var(--radius-sm);
-    transition: color 0.15s;
+    color: var(--ink-soft);
   }
-  #repo-link:hover { color: var(--ink); }
+  #links a:hover { color: var(--ink); }
+  /* Live model link gets the accent — it's the thing we want visitors to try. */
+  #live-link {
+    background: var(--ink) !important;
+    color: #fff !important;
+    border-color: var(--ink) !important;
+  }
+  #live-link:hover { opacity: 0.86; }
 
   /* Dock — floating control panel at the bottom. */
   #dock {
@@ -125,7 +136,8 @@
 
   @media (max-width: 600px) {
     #header { top: 14px; left: 16px; }
-    #repo-link { top: 14px; right: 16px; }
+    #links { top: 14px; right: 16px; gap: 6px; }
+    #links a { padding: 6px 10px; font-size: 12px; }
     #tagline { display: none; }
     #info { left: 16px; bottom: auto; top: 64px; }
   }
@@ -135,9 +147,15 @@
 
 <div id="header">
   <span id="brand">QR-Bloom</span>
-  <span id="tagline">A 3D voxel tree whose top-down silhouette is a scannable QR code.</span>
+  <span id="tagline">
+    Procedural preview — same renderer, samples generated without the diffusion model.
+    For real model output, <strong>try the live model</strong>.
+  </span>
 </div>
-<a id="repo-link" href="https://github.com/rocknroll17/QR-Bloom" target="_blank" rel="noopener">GitHub →</a>
+<div id="links">
+  <a id="live-link" href="https://qr-bloom.rocknroll17.com/" target="_blank" rel="noopener">Live model →</a>
+  <a href="https://github.com/rocknroll17/QR-Bloom" target="_blank" rel="noopener">GitHub →</a>
+</div>
 
 <div id="dock">
   <select id="theme-select" aria-label="Tree theme"></select>
