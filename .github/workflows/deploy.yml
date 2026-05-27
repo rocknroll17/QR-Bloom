@@ -36,16 +36,24 @@ jobs:
     steps:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          CHECKPOINTS_DIR: ${{ secrets.DEPLOY_CHECKPOINTS_DIR }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: 22
+          # On a release event, pin to that exact tag — pulling :latest races
+          # release.yml and can resolve to the *previous* version that still
+          # answers under :latest, leaving prod a release behind.
+          envs: RELEASE_TAG,INPUT_TAG,CHECKPOINTS_DIR
           script: |
             set -e
-            TAG="${{ github.event.inputs.tag || 'latest' }}"
+            TAG="${INPUT_TAG:-${RELEASE_TAG:-latest}}"
             IMAGE="ghcr.io/rocknroll17/qr-bloom:${TAG}"
-            CHECKPOINTS="${{ secrets.DEPLOY_CHECKPOINTS_DIR }}"
+            CHECKPOINTS="${CHECKPOINTS_DIR}"
 
             echo "==> Pulling ${IMAGE}"
             # release.yml fires on the same tag push and races us. If the
