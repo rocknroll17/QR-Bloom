@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.8](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.7...v1.1.8) (2026-05-27)
+
+
+### Bug Fixes
+
+* **treegen:** narrow palm augmentation variance ([#41](https://github.com/rocknroll17/QR-Bloom/issues/41)) ([a340f05](https://github.com/rocknroll17/QR-Bloom/commit/a340f05d98c064b290eb3c7c8f41eb20787f0610))
+
 ## [1.1.7](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.6...v1.1.7) (2026-05-27)
 
 
