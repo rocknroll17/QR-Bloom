@@ -457,6 +457,13 @@ def _aug_range(theme):
     """Returns (h_lo,h_hi, r_lo,r_hi, d_lo,d_hi, salt) — per-species ranges for height, radius, density, and coordinate salt."""
     if theme in _STRUCTURAL:
         return (0.68, 1.50, 0.72, 1.42, 1.0, 1.0, 0)
+    if theme == "palm":
+        # Palm has the sparsest, thinnest target (long slim trunk + 9 radiating
+        # fronds at the top). Wide jitter was making the diffusion model spend
+        # its capacity chasing many palm variants and falling into a "trunk
+        # only" local minimum at v4/v5. Narrow the variance so the canonical
+        # palm shape dominates the training signal.
+        return (0.92, 1.08, 0.92, 1.08, 0.85, 1.15, 2)
     return (0.75, 1.42, 0.80, 1.35, 0.65, 1.40, 4)
 
 
