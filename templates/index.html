@@ -268,7 +268,7 @@ async function generateFromUrl() {
     showCells(d.cells);
     copyEmbedBtn.disabled = false;
     const dt = ((performance.now() - t0)/1000).toFixed(1);
-    urlStatus.textContent = `${d.theme} · v${d.version} · ${d.count} vox · ckpt ep${d.ckpt_ep} · ${dt}s · "${d.url}"`;
+    urlStatus.textContent = `${d.theme} · v${d.version} · ${dt}s`;
   } catch (e) {
     urlStatus.textContent = 'Error: ' + e.message;
   } finally {
