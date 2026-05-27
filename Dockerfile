@@ -34,6 +34,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Project code.
 COPY qrbloom/ ./qrbloom/
 COPY templates/ ./templates/
+# gallery.py serves docs/qrbloom-viewer.js at /qrbloom-viewer.js, so the
+# viewer module has to be present inside the image too. The rest of docs/
+# (Pages site, samples) lives only on GitHub Pages — no need to ship it.
+COPY docs/qrbloom-viewer.js ./docs/qrbloom-viewer.js
 COPY train.py evaluate.py gallery.py ./
 
 ENV PYTHONUNBUFFERED=1
