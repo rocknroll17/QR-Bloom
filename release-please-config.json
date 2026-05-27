@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "qr-bloom",
+      "include-component-in-tag": false,
+      "bump-minor-pre-major": false,
+      "bump-patch-for-minor-pre-major": false,
+      "changelog-sections": [
+        { "type": "feat",     "section": "Features" },
+        { "type": "fix",      "section": "Bug Fixes" },
+        { "type": "perf",     "section": "Performance" },
+        { "type": "refactor", "section": "Refactor" },
+        { "type": "ui",       "section": "UI" },
+        { "type": "docs",     "section": "Documentation" },
+        { "type": "chore",    "section": "Chores",       "hidden": true },
+        { "type": "ci",       "section": "CI",           "hidden": true },
+        { "type": "test",     "section": "Tests",        "hidden": true },
+        { "type": "style",    "section": "Style",        "hidden": true }
+      ]
+    }
+  },
+  "include-component-in-tag": false,
+  "separator": ""
+}
