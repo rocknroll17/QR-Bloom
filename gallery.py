@@ -110,7 +110,10 @@ def _load_model(version: int | None = None):
 
     ck_path = _ckpt_path_for_version(version)
     if not os.path.exists(ck_path):
-        raise FileNotFoundError(
+        # ValueError (not FileNotFoundError) so the API exception handler can
+        # safely surface the message without risking that some unrelated
+        # FileNotFoundError from torch / disk I/O leaks a raw path.
+        raise ValueError(
             f"No trained model is available for QR version {version}.")
     real_path = os.path.realpath(ck_path)
     mtime = os.path.getmtime(real_path)
@@ -369,6 +372,21 @@ _PNG_SAFE = re.compile(r'^(loss|epoch_\d+)\.png$')
 _JSON_SAFE = re.compile(r'^(ep\d+|unseen_gt)\.json$')
 _ASSET_SAFE = re.compile(r'^[\w-]+\.hdr$')
 
+
+def _safe_path_in(base: str, name: str) -> str | None:
+    """Resolve `base/name` and return it only if it stays inside `base`.
+
+    Defense in depth: the regex allowlists above already reject path
+    separators, but resolving + containment-checking makes path injection
+    impossible regardless of any future relaxation, and satisfies static
+    analyzers that don't recognize regex-based sanitization.
+    """
+    base_real = os.path.realpath(base)
+    full_real = os.path.realpath(os.path.join(base_real, name))
+    if full_real == base_real or full_real.startswith(base_real + os.sep):
+        return full_real
+    return None
+
 app = FastAPI()
 
 
@@ -409,10 +427,8 @@ def route_state():
 def route_img(name: str):
     if not _PNG_SAFE.match(name):
         return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    full = os.path.join(RUNS_DIR, name)
-    if not os.path.exists(full):
-        full = os.path.join(ROOT, name)
-    if not os.path.exists(full):
+    full = _safe_path_in(RUNS_DIR, name) or _safe_path_in(ROOT, name)
+    if not full or not os.path.exists(full):
         return Response(content=b"not found", status_code=404, media_type="text/plain")
     with open(full, "rb") as f:
         data = f.read()
@@ -425,10 +441,8 @@ def route_data(name: str):
     if not _JSON_SAFE.match(name):
         return Response(content=b"not allowed", status_code=404, media_type="text/plain")
     fname = re.sub(r'^ep(\d+)\.json$', r'epoch_\1.json', name)
-    full = os.path.join(RUNS_DIR, fname)
-    if not os.path.exists(full):
-        full = os.path.join(ROOT, fname)
-    if not os.path.exists(full):
+    full = _safe_path_in(RUNS_DIR, fname) or _safe_path_in(ROOT, fname)
+    if not full or not os.path.exists(full):
         return Response(content=b"not found", status_code=404, media_type="text/plain")
     with open(full, "rb") as f:
         data = f.read()
@@ -440,8 +454,8 @@ def route_data(name: str):
 def route_assets(name: str):
     if not _ASSET_SAFE.match(name):
         return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    full = os.path.join(ROOT, "assets", name)
-    if not os.path.exists(full):
+    full = _safe_path_in(os.path.join(ROOT, "assets"), name)
+    if not full or not os.path.exists(full):
         return Response(content=b"not found", status_code=404, media_type="text/plain")
     with open(full, "rb") as f:
         data = f.read()
@@ -480,10 +494,10 @@ def route_api_generate(body: _GenerateBody):
     try:
         result = model_generate(url, theme, steps=100, version=body.version)
         return JSONResponse(content=result)
-    except (ValueError, FileNotFoundError) as e:
-        # Expected user-facing problems (text too long, no model for that
-        # version, etc.) — these messages are written to be user-friendly,
-        # so it's safe to pass them through.
+    except ValueError as e:
+        # ValueError is reserved for deliberate user-facing messages (text
+        # too long, no model for that version, etc.). Other exception types
+        # are treated as internal and their messages are not surfaced.
         return JSONResponse(content={"error": str(e)}, status_code=400)
     except Exception:
         # Unexpected failure (CUDA OOM, malformed checkpoint, etc.) — hide
