@@ -76,20 +76,24 @@ LABELS = {"cherryblossom": "Cherry Blossom", "pine": "Pine", "socotra": "Dragon 
           "saguaro_cactus": "Saguaro Cactus", "palm": "Palm", "acacia": "Acacia"}
 
 
-def _th_bn(theme, scale):
-    """Returns (trunk_height, search_limit) per species. scale = proportional multiplier for QR version."""
+def _th_bn(theme, scale_xy, scale_z):
+    """Returns (trunk_height, search_limit) per species.
+
+    scale_xy drives canopy reach (grows with QR version), scale_z drives
+    trunk height. Z is capped because the voxel grid Z is fixed (32).
+    """
     fl = math.floor
     table = {
-        "cherryblossom":  (fl(9 * scale), fl(10 * scale)),
-        "pine":           (fl(7 * scale), fl(8 * scale)),
-        "socotra":        (fl(7 * scale) + fl(5 * scale), fl(10 * scale)),
-        "maple":          (fl(7 * scale), fl(8 * scale)),
-        "baobab":         (fl(10 * scale) + fl(7 * scale), fl(8 * scale)),
-        "willow":         (fl(7 * scale) + fl(3 * scale), fl(10 * scale)),
-        "magnolia":       (fl(7 * scale), fl(10 * scale)),
-        "saguaro_cactus": (1, fl(10 * scale)),
-        "palm":           (fl(13 * scale), fl(12 * scale)),
-        "acacia":         (fl(9 * scale), fl(10 * scale)),
+        "cherryblossom":  (fl(9 * scale_z), fl(10 * scale_xy)),
+        "pine":           (fl(7 * scale_z), fl(8 * scale_xy)),
+        "socotra":        (fl(7 * scale_z) + fl(5 * scale_z), fl(10 * scale_xy)),
+        "maple":          (fl(7 * scale_z), fl(8 * scale_xy)),
+        "baobab":         (fl(10 * scale_z) + fl(7 * scale_z), fl(8 * scale_xy)),
+        "willow":         (fl(7 * scale_z) + fl(3 * scale_z), fl(10 * scale_xy)),
+        "magnolia":       (fl(7 * scale_z), fl(10 * scale_xy)),
+        "saguaro_cactus": (1, fl(10 * scale_xy)),
+        "palm":           (fl(11 * scale_z), fl(12 * scale_xy)),
+        "acacia":         (fl(9 * scale_z), fl(10 * scale_xy)),
     }
     return table[theme]
 
@@ -122,51 +126,117 @@ def _seg_dist_field(x, z, y, p0, p1):
 
 # ===========================================================================
 # Per-species shape builders — return (trunk, leaf, flower) bool masks
-#   x,z: center-aligned planar coords  y: height  cyy: y - trunk_height  rad: canopy radius
+#   x,z: center-aligned planar coords  y: height  cyy: y - trunk_height
+#   rad: canopy radius (already scaled by version)  bnd: pine cone bound
 #   cn: cluster noise  core: trunk core region  dens: density (after augmentation)
+#   sc: scale_xy (>=1.0, grows with QR version) — multiply any voxel-radius
+#       constant by `sc` so trunks/branches stay proportional at larger versions.
 # ===========================================================================
-def _cherry(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
+def _cherry(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
     rxz = np.sqrt(x ** 2 + z ** 2)
-    trunk = (y <= th) & (rxz <= 1.5)
+    trunk = (y <= th) & (rxz <= 1.5 * sc)
     bump = np.where(_hash(x, y, z) > 0.95, 1.5, 0.0)
     shape = np.sqrt(x ** 2 / 2.5 + cyy ** 2 / 0.5 + z ** 2 / 2.5) <= rad * 1.3 + bump
     leaf = (y >= th * 0.4) & shape & ~trunk & (core | (cn < dens))
     return trunk, leaf, np.zeros_like(trunk)
 
 
-def _pine(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
+def _pine(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
     rxz = np.sqrt(x ** 2 + z ** 2)
-    trunk = (y <= th) & (rxz <= 1.5)
+    trunk = (y <= th) & (rxz <= 1.5 * sc)
     cone = bnd * 2.2
     shape = (cyy >= -1) & (cyy < cone) & (rxz <= np.maximum(cone - cyy, 0) * 0.45)
     leaf = shape & ~trunk & (core | (cn < dens))
     return trunk, leaf, np.zeros_like(trunk)
 
 
-def _maple(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
+def _maple(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
     rxz = np.sqrt(x ** 2 + z ** 2)
-    trunk = (y <= th) & (rxz <= 1.5)
+    trunk = (y <= th) & (rxz <= 1.5 * sc)
     shape = np.sqrt(x ** 2 / 2.5 + cyy ** 2 + z ** 2 / 2.5) <= rad
     leaf = (y >= th * 0.4) & shape & ~trunk & (core | (cn < dens))
     return trunk, leaf, np.zeros_like(trunk)
 
 
-def _willow(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
+def _willow(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
+    """Weeping willow: solid dome + cascading drapes from its underside.
+
+    Each drape starts at the *dome's curved underside* at its (x, z) column
+    (not at the trunk-top plane) and hangs straight down. The dome surface
+    is highest at the rim (cyy_bot ≈ 0) and lowest at the center (cyy_bot
+    ≈ -canopy_r/√1.8), so rim drapes naturally start higher and can reach
+    further down — that's the silhouette real weeping willows show.
+
+    Zones (selection density only; lengths are similar so the silhouette
+    reads as a unified curtain, not a fringe-vs-stub mismatch):
+      * Rim band:  ~35% of columns drape (curtain effect, not packed).
+      * Inner:     ~12% of columns drape (sparse streams through the front).
+      * Outside the canopy footprint: empty.
+    """
     rxz = np.sqrt(x ** 2 + z ** 2)
-    trunk = (y <= th) & (rxz <= 1.8)
-    g = _hash(np.floor(x / 2), np.floor(y / 2), np.floor(z / 2))
-    canopy_r = rad * 1.6 + np.where(g > 0.5, 1.5, -1.5)
+    trunk = (y <= th) & (rxz <= 1.8 * sc)
+
+    # --- solid dome (subtle texture from cn noise) ------------------------
+    canopy_r = rad * 1.6
     dome = ((cyy >= -1) & (cyy <= rad * 1.2)
             & (np.sqrt(x ** 2 / 1.8 + cyy ** 2 * 1.8 + z ** 2 / 1.8) <= canopy_r))
-    v = _hash(x, np.zeros_like(x) + 0.0, z)
-    drape_len = rad * 1.2 + v * rad * 2.5
-    drape = ((cyy < 0) & (cyy >= -drape_len) & (v < 0.2)
-             & (np.sqrt(x ** 2 / 1.5 + z ** 2 / 1.5) <= rad * 1.4))
-    leaf = (dome | drape) & ~trunk & (core | (cn < dens))
+
+    # --- dome's lower surface (cyy_bot ≤ 0) at each (x,z) -----------------
+    # Dome equation: (x² + z²)/1.8 + cyy²·1.8 ≤ canopy_r²
+    # Lower surface ⇒ cyy_bot = -√((canopy_r² - rxz²/1.8) / 1.8)
+    rxz_sq = x ** 2 + z ** 2
+    arg = (canopy_r ** 2 - rxz_sq / 1.8) / 1.8
+    cyy_bot = -np.sqrt(np.where(arg > 0, arg, 0))      # ≤ 0 everywhere
+
+    # --- footprint / zones ------------------------------------------------
+    rim_outer = canopy_r * math.sqrt(1.8)              # max rxz under dome
+    band_width = max(1.8, 2.0 * sc)
+    in_canopy = rxz <= rim_outer
+    in_rim    = in_canopy & (rxz >= rim_outer - band_width)
+    # Inner band must clear the trunk fully — willow trunk radius is 1.8·sc,
+    # so anything inside that gets hidden by the trunk voxels.
+    trunk_r = 1.8 * sc
+    in_inner  = in_canopy & ~in_rim & (rxz > trunk_r + 1.5)
+
+    # Two independent hash channels: one for selection, one for length so
+    # the length isn't correlated with selection threshold.
+    sel_n = _hash(np.floor(x),       np.zeros_like(x),         np.floor(z))
+    len_n = _hash(np.floor(x) + 31., np.zeros_like(x) + 7.,    np.floor(z) + 13.)
+
+    rim_drape   = in_rim   & (sel_n > 0.78)            # ~22% of rim columns
+    inner_drape = in_inner & (sel_n > 0.90)            # ~10% of inner columns
+    has_drape = rim_drape | inner_drape
+
+    # Drape lengths — varied per column so the cascade has natural break-up.
+    # Rim drapes can be slightly longer (they start higher on the dome).
+    rim_len   = (0.5 + 1.3 * len_n) * rad              # 0.5·rad → 1.8·rad
+    inner_len = (0.4 + 1.0 * len_n) * rad              # 0.4·rad → 1.4·rad
+    drape_len = np.where(in_rim, rim_len, inner_len)
+
+    # Drape hangs from cyy = 0 (dome's lowest layer) down to cyy_bot - drape_len.
+    # We anchor at cyy < 0 instead of "cyy_bot + overlap" because the dome
+    # itself only exists for cyy >= -1, so the strand must start from the
+    # dome's actual bottom surface (not the analytic cyy_bot which can be
+    # several voxels below the real dome geometry in inner regions).
+    in_drape_height = (cyy < 0) & (cyy >= cyy_bot - drape_len)
+    drape = has_drape & in_drape_height & in_canopy & (y >= 1)
+
+    # Force two dense layers on the dome:
+    # 1) dome_bottom_solid: the dome's actual lowest voxel layer (cyy = -1).
+    #    This is the surface the drape attaches to. Without it the underside
+    #    is sparse (cn<dens noise) and sparse drapes look disconnected.
+    # 2) dome_underside: the analytic underside (cyy < cyy_bot + 3) — for
+    #    rim regions where cyy_bot ≈ 0 this overlaps with (1); for inner
+    #    regions where cyy_bot is much below -1 this is empty (intersection
+    #    with dome's cyy >= -1 is empty), so (1) is the one that matters there.
+    dome_bottom_solid = dome & (cyy < 0)
+    dome_underside = dome & (cyy < cyy_bot + 3.0)
+    leaf = (dome & (core | (cn < dens))) | dome_bottom_solid | dome_underside | drape
+    leaf = leaf & ~trunk
     return trunk, leaf, np.zeros_like(trunk)
 
 
-def _socotra(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
+def _socotra(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
     rxz = np.sqrt(x ** 2 + z ** 2)
     in_can = (y >= 0) & (cyy >= -2) & (cyy <= rad * 3.5) & (rxz <= rad * 3)
     ang = np.arctan2(z, x)
@@ -176,28 +246,28 @@ def _socotra(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
     freq = 10 + math.floor(rad)
     twist = frac * 3.5
     striped = (np.cos(freq * ang + twist) > 0.25) | (np.cos(freq * ang - twist) > 0.25)
-    near_ring = np.abs(rxz - ring_r) < 1.8
+    near_ring = np.abs(rxz - ring_r) < 1.8 * sc
     is_branch = striped & near_ring & (cyy >= 0) & (cyy < m * 0.95)
     cap_m, cap_c = m * 0.75, m * 0.9
     cap = (cyy >= cap_m) & ((rxz / g) ** 2 + ((cyy - cap_m) / cap_c) ** 2 <= 1)
     rim = ((cyy >= m * 0.65) & (cyy < cap_m)
-           & (rxz <= ring_r + 2.5) & (rxz >= ring_r - 1.5))
-    trunk = in_can & (((rxz < 2.5) & (cyy < rad * 0.4)) | is_branch)
-    trunk = trunk | (~in_can & (y <= np.floor(th)) & (rxz <= 1.5))
+           & (rxz <= ring_r + 2.5 * sc) & (rxz >= ring_r - 1.5 * sc))
+    trunk = in_can & (((rxz < 2.5 * sc) & (cyy < rad * 0.4)) | is_branch)
+    trunk = trunk | (~in_can & (y <= np.floor(th)) & (rxz <= 1.5 * sc))
     leaf = in_can & (cap | rim) & ~trunk & (cn < 0.85)
     return trunk, leaf, np.zeros_like(trunk)
 
 
-def _baobab(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
+def _baobab(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
     e, H = x.shape[0], y.shape[1]
     trunk = np.zeros((e, H, e), dtype=bool)
     leaf = np.zeros((e, H, e), dtype=bool)
     rxz = np.sqrt(x ** 2 + z ** 2)
-    # Trunk: thick at the base, tapering toward the top
+    # Trunk: thick at the base, tapering toward the top — all radii scaled by sc
     t = np.clip(y / max(th, 1), 0, 1)
-    r = np.where(t <= 0.35, 2 + 4 * (t / 0.35),
-                 np.where(t <= 0.75, 6 - 1.5 * ((t - 0.35) / 0.4),
-                          4.5 - 1.3 * ((t - 0.75) / 0.25)))
+    r = np.where(t <= 0.35, (2 + 4 * (t / 0.35)) * sc,
+                 np.where(t <= 0.75, (6 - 1.5 * ((t - 0.35) / 0.4)) * sc,
+                          (4.5 - 1.3 * ((t - 0.75) / 0.25)) * sc))
     trunk |= (y >= 0) & (y <= th) & (rxz <= r)
     # 6 main branches, each with a leaf cluster at the tip
     spread = rad * 1.45
@@ -208,7 +278,7 @@ def _baobab(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
         tt = np.clip((y - crown_y) / span, 0, 1)
         bx = math.cos(ang) * spread * tt
         bz = math.sin(ang) * spread * tt
-        thick = np.maximum(2 - tt * 1.3, 0.7)
+        thick = np.maximum((2 - tt * 1.3) * sc, 0.7 * sc)
         trunk |= (y >= crown_y) & (y <= th) & (np.sqrt((x - bx) ** 2 + (z - bz) ** 2) <= thick)
         tipx, tipz = math.cos(ang) * spread, math.sin(ang) * spread
         leaf |= (np.sqrt((x - tipx) ** 2 + cyy ** 2 / 1.3 + (z - tipz) ** 2) <= rad * 0.85)
@@ -216,49 +286,85 @@ def _baobab(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
     return trunk, leaf, np.zeros_like(trunk)
 
 
-def _saguaro_cactus(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
+def _saguaro_cactus(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
+    """Saguaro cactus: central body + two side arms with a clear voxel gap.
+
+    The body and arms are separated by a `gap` of ~1 voxel of empty space so
+    the silhouette reads as three distinct columns instead of one fused
+    blob. The horizontal elbow tube starts *outside* the body to preserve
+    that gap.
+    """
     e, H = x.shape[0], y.shape[1]
     leaf = np.zeros((e, H, e), dtype=bool)
     flower = np.zeros((e, H, e), dtype=bool)
+    # `rad` already carries scale_xy; `s` is the saguaro's internal radial
+    # multiplier (driven by canopy radius). Body / arm thicknesses scale
+    # with it; the body↔arm gap stays ≈1 voxel (mild scaling so it remains
+    # visible at large sizes).
     s = max(1.0, rad / 5.0)
+    body_r = 2.6 * s
+    arm_r = 1.9 * s
+    gap = max(1.0, 0.8 * sc)              # clear voxel space between body and arm
+    arm_x = body_r + gap + arm_r          # arm column center distance
+
     body_h = 17 * s
     # Central column + rounded top
-    leaf |= (x ** 2 + z ** 2 <= (2.6 * s) ** 2) & (y >= 0) & (y <= body_h)
-    leaf |= (x ** 2 + (y - body_h) ** 2 + z ** 2 <= (2.6 * s) ** 2)
+    leaf |= (x ** 2 + z ** 2 <= body_r ** 2) & (y >= 0) & (y <= body_h)
+    leaf |= (x ** 2 + (y - body_h) ** 2 + z ** 2 <= body_r ** 2)
+
     tops = [(0.0, body_h)]
+    # Two arms: low arm on -x, higher arm on +x.
     for (ay, side, uph) in [(5 * s, -1, 12 * s), (8 * s, 1, 15 * s)]:
-        ar = 1.9 * s
-        # Elbow: extends horizontally then turns upward
-        d1, _ = _seg_dist_field(x, z, y, (0, ay, 0), (side * 4 * s, ay, 0))
-        leaf |= (d1 <= ar) & (y >= ay - ar) & (y <= ay + ar)
-        leaf |= (np.sqrt((x - side * 4 * s) ** 2 + z ** 2) <= ar) & (y >= ay) & (y <= uph)
-        tops.append((side * 4 * s, uph))
+        # Elbow tube only spans outside the body surface, preserving the gap.
+        elbow_inner_x = side * (body_r + gap)
+        elbow_outer_x = side * arm_x
+        d1, _ = _seg_dist_field(x, z, y,
+                                 (elbow_inner_x, ay, 0),
+                                 (elbow_outer_x, ay, 0))
+        leaf |= (d1 <= arm_r) & (y >= ay - arm_r) & (y <= ay + arm_r)
+        # Vertical arm column rises from the elbow.
+        leaf |= (np.sqrt((x - elbow_outer_x) ** 2 + z ** 2) <= arm_r) \
+                & (y >= ay) & (y <= uph)
+        tops.append((elbow_outer_x, uph))
+
     for (tx, tyv) in tops:
-        flower |= (x - tx) ** 2 + (y - tyv - 1.2) ** 2 + z ** 2 <= 1.7 ** 2
+        flower |= (x - tx) ** 2 + (y - tyv - 1.2) ** 2 + z ** 2 <= (1.7 * sc) ** 2
     leaf &= ~flower
     return np.zeros_like(leaf), leaf, flower
 
 
-def _magnolia(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
+def _magnolia(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
     rxz = np.sqrt(x ** 2 + z ** 2)
-    trunk = (y <= th) & (rxz <= 1.5)
+    trunk = (y <= th) & (rxz <= 1.5 * sc)
     in_can = (y >= th * 0.4) & (np.sqrt(x ** 2 / 2.2 + cyy ** 2 / 1.2 + z ** 2 / 2.2) <= rad * 1.3)
-    flower = in_can & (_hash(x, y, z) > 0.93) & ~trunk
+    # Flower threshold scales mildly with sc so larger canopies don't end up
+    # carpeted in white blossoms — the canopy voxel count itself grows ~sc³,
+    # so a fixed 0.93 threshold would multiply flowers along with size.
+    flower_thr = 0.93 + max(0.0, (sc - 1.0)) * 0.03
+    flower = in_can & (_hash(x, y, z) > flower_thr) & ~trunk
     leaf = in_can & ~flower & ~trunk & (core | (cn < dens))
     return trunk, leaf, flower
 
 
-def _palm(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
-    """Tall, slender trunk with a crown of radiating fronds at the top."""
+def _palm(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
+    """Tall, slender trunk with a crown of radiating fronds at the top.
+
+    Frond arc height scales with `sc` (so larger trees have proportionally
+    taller crowns) but the drooping term is intentionally damped — at large
+    sc both terms scaled together made the fronds plunge way below the
+    trunk top, which looks like sagging tentacles rather than palm leaves.
+    """
     e, H = x.shape[0], y.shape[1]
-    trunk_r = 1.9
+    trunk_r = 1.9 * sc
     rxz = np.sqrt(x ** 2 + z ** 2)
     trunk = (y >= 0) & (y <= th) & (rxz <= trunk_r)
 
-    # Leaves: n_fronds radiating branches, each drooping in an arc
     leaf = np.zeros((e, H, e), dtype=bool)
     n_fronds = 9
-    L = rad * 2.0          # Frond length proportional to radius
+    L = rad * 2.0
+    # Drooping scales mildly with sc (sqrt) instead of linearly, so v5 fronds
+    # don't sag dramatically more than v2 fronds.
+    droop_scale = math.sqrt(sc)
     for i in range(n_fronds):
         ang = 2.0 * math.pi * i / n_fronds
         ca, sa = math.cos(ang), math.sin(ang)
@@ -267,32 +373,44 @@ def _palm(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
             rr = L * tt
             frond_x = ca * rr
             frond_z = sa * rr
-            # Each frond arcs upward first, then droops toward the tip
-            frond_y = th + 4.5 * math.sin(tt * 2.3) - 6.0 * tt * tt
-            sphere_r = max(0.5, 1.7 - 0.7 * tt)
+            # Arc up: scales fully with sc (taller crown at larger versions)
+            # Droop:  scales only with sqrt(sc) (limits sag at larger versions)
+            frond_y = th + 4.5 * sc * math.sin(tt * 2.3) - 6.0 * droop_scale * tt * tt
+            sphere_r = max(0.5 * sc, (1.7 - 0.7 * tt) * sc)
             leaf |= ((x - frond_x) ** 2 + (y - frond_y) ** 2 + (z - frond_z) ** 2
                      <= sphere_r ** 2)
     leaf &= ~trunk
     return trunk, leaf, np.zeros_like(trunk)
 
 
-def _acacia(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr):
-    """Tall trunk with a flat, wide umbrella-shaped canopy at the top.
+def _acacia(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
+    """Acacia tortilis (umbrella thorn): wide canopy with a concave underside.
 
-    cy = th + thick - 4.0 offsets the canopy down so it overlaps the trunk tip.
+    Real flat-top acacias have a near-flat top and a hollow / concave bottom
+    — the silhouette reads as an umbrella, not a dome. We model that by
+    subtracting an inner ellipsoid shifted *down* relative to the outer one,
+    so it carves the bottom-center of the canopy. Rim thickness stays full,
+    center underside curves upward.
     """
     rxz = np.sqrt(x ** 2 + z ** 2)
-    trunk = (y >= 0) & (y <= th) & (rxz <= 1.8)
+    trunk = (y >= 0) & (y <= th) & (rxz <= 1.8 * sc)
 
-    # Umbrella disc: wide (R) and flat (thick) ellipsoid, overlapping the trunk top
-    thick = max(2.0, rad * 0.6)
+    # Outer canopy: wide, flat ellipsoid sitting over the trunk tip.
+    thick = max(2.0 * sc, rad * 0.6)
     R = rad * 2.0
-    cy = th + thick - 4.0           # Lowered to overlap the trunk and keep it connected
-    # Ellipsoid: (x/R)^2 + ((y-cy)/thick)^2 + (z/R)^2 <= 1
-    in_ellip = (x ** 2 / (R * R) + (y - cy) ** 2 / (thick * thick)
+    cy = th + thick - 4.0 * sc       # lowered to overlap the trunk
+    in_outer = (x ** 2 / (R * R) + (y - cy) ** 2 / (thick * thick)
                 + z ** 2 / (R * R)) <= 1.0
-    # Flatten the bottom — clip the lower face so it reaches the trunk
-    canopy = in_ellip & (y >= cy - thick * 0.8)
+
+    # Inner carve-out: smaller ellipsoid shifted down so its upper half
+    # punches through the outer canopy's underside, leaving a concave bowl.
+    R_in = R * 0.80
+    thick_in = thick * 0.95
+    cy_in = cy - thick * 0.55
+    in_inner = (x ** 2 / (R_in * R_in) + (y - cy_in) ** 2 / (thick_in * thick_in)
+                 + z ** 2 / (R_in * R_in)) <= 1.0
+
+    canopy = in_outer & ~in_inner & (y >= cy - thick * 0.95)
     leaf = canopy & ~trunk & (core | (cn < dens))
     return trunk, leaf, np.zeros_like(trunk)
 
@@ -327,7 +445,12 @@ def build_tree(theme, e, H, npr, augment=True):
     theme = theme if theme in _SPECIES else "cherryblossom"
     spec = THEMES[theme]
     x, y, z = _axes(e, H)
-    scale = max(1.0, e / 21.0)
+    # Both XY and Z grow with QR version, but Z grows slightly faster
+    # (×1.25) so taller trees look proportional rather than squat in larger
+    # codes. The grid Z (qr.grid_z_for_version) is computed with the same
+    # multiplier built-in, so trunks stay within the grid (clamped to H-4).
+    scale_xy = max(1.0, e / 21.0)
+    scale_z = scale_xy * 1.25
 
     # --- augmentation: jitter radius, trunk height, density, and coordinate salt within per-species ranges ---
     h_lo, h_hi, r_lo, r_hi, d_lo, d_hi, salt = _aug_range(theme)
@@ -342,9 +465,11 @@ def build_tree(theme, e, H, npr, augment=True):
         hm = rm = dm = 1.0
         sx = sy = sz = 0
 
-    radius = max(2.0, math.floor(5 * scale)) * rm
-    th0, bnd = _th_bn(theme, scale)
-    th = max(1.0, th0 * hm)
+    radius = max(2.0, math.floor(5 * scale_xy)) * rm
+    th0, bnd = _th_bn(theme, scale_xy, scale_z)
+    # Cap th so the trunk + crown fit inside H. Leave a small headroom for
+    # leaves that sit above the trunk tip.
+    th = max(1.0, min(th0 * hm, H - 4))
     dens = spec["density"] * dm
 
     cyy = y - th
@@ -352,7 +477,8 @@ def build_tree(theme, e, H, npr, augment=True):
     cn = _hash(np.floor(x / cs) + sx, np.floor(y / cs) + sy, np.floor(z / cs) + sz)
     core = np.sqrt(x ** 2 + cyy ** 2 + z ** 2) < radius * 0.4
 
-    return _SPECIES[theme](x, y, z, cyy, th, radius, bnd, cn, core, dens, npr)
+    return _SPECIES[theme](x, y, z, cyy, th, radius, bnd, cn, core, dens, npr,
+                            scale_xy)
 
 
 def _gen(qr, theme, rng, augment):
@@ -366,7 +492,12 @@ def _gen(qr, theme, rng, augment):
     npr = np.random.default_rng(rng.randint(0, 2 ** 31 - 1))
     theme = theme if theme in _SPECIES else "cherryblossom"
     spec = THEMES[theme]
-    e, H = len(qr), 32
+    e = len(qr)
+    # H scales isotropically with the QR footprint (qr.grid_z_for_version);
+    # legacy callers that pre-date that helper still get sensible behavior
+    # via H = max(32, e * 32/21).
+    import math as _m
+    H = max(32, ((_m.ceil(e * 32 / 21 / 4)) * 4))
 
     trunk, leaf, flower = build_tree(theme, e, H, npr, augment)
     dark = np.array([[bool(qr[r][c]) for c in range(e)] for r in range(e)], dtype=bool)
@@ -412,19 +543,33 @@ def generate_voxels_aug(qr, theme="cherryblossom", rng=None):
 
 THEME_NAMES = list(THEMES)
 
-# Tree attribute measurement — used as attribute signals during training (height / fullness / spread).
-_ATTR_NORM = {"height": 30.0, "fullness": 1800.0, "spread": 22.0}
+# Tree attribute measurement — used as attribute signals during training
+# (height / fullness / spread), each normalized to [0, 1].
+# Height is normalized against the fixed Z extent (30 ≈ usable canopy span).
+# Fullness and spread scale with QR side length so the signal stays in [0,1]
+# regardless of QR version.
+_ATTR_HEIGHT_NORM = 30.0
 
 
-def tree_attributes(voxels):
-    """Voxel list -> [height, fullness, spread], each normalized to [0, 1]."""
+def tree_attributes(voxels, qr_side: int | None = None):
+    """Voxel list -> [height, fullness, spread] in [0, 1].
+
+    qr_side: side length of the QR matrix (modules) that the tree was built
+        on. If None, defaults to 21 (v1) for backward compatibility.
+    """
     tv = [v for v in voxels if not v["is_base"]]
     if not tv:
         return [0.0, 0.0, 0.0]
+    if qr_side is None:
+        qr_side = 21
     ys = [v["pos"][1] for v in tv]
     xs = [v["pos"][0] for v in tv]
     zs = [v["pos"][2] for v in tv]
-    height = max(ys) / _ATTR_NORM["height"]
-    fullness = len(tv) / _ATTR_NORM["fullness"]
-    spread = max(max(xs) - min(xs), max(zs) - min(zs)) / _ATTR_NORM["spread"]
+    # Fullness normalization grows quadratically with footprint (≈ canopy area).
+    # Spread normalization grows linearly with footprint.
+    full_norm = 1800.0 * (qr_side / 21.0) ** 2
+    spread_norm = max(2.0, qr_side - 0.0)
+    height = max(ys) / _ATTR_HEIGHT_NORM
+    fullness = len(tv) / full_norm
+    spread = max(max(xs) - min(xs), max(zs) - min(zs)) / spread_norm
     return [min(1.0, max(0.0, a)) for a in (height, fullness, spread)]

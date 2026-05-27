@@ -222,6 +222,54 @@ checkpoints/
 runs/
 runs*/
 samples/
+previews/
+backups/
 *.pt
 *.pth
 data/
+
+# Local reference: read-only links / copies to qr-tree-diffusion and any
+# other off-repo material. Useful during development; never shipped.
+_reference/
+_scratch/
+
+# ---------------------------------------------------------------------------
+# Claude Code / Anthropic agent state — never push to GitHub.
+# ---------------------------------------------------------------------------
+# CLAUDE.md is project docs for Claude itself; we keep it LOCAL only (not in
+# the public repo). Also ignore any local variants and other agent state.
+CLAUDE.md
+CLAUDE.*.md
+CLAUDE_*.md
+AGENT.md
+AGENTS.md
+.claude/
+.claude*.json
+.claude*.local.json
+.anthropic/
+.mcp.json
+.mcp.local.json
+
+# Other AI assistant / IDE-agent state.
+.cursor/
+.copilot/
+.aider*
+.cline/
+.continue/
+.codeium/
+.aiconfig
+agents/
+.agents/
+
+# Generated planning / notes that any agent might drop locally.
+NOTES.local.md
+PLAN.local.md
+TODO.local.md
+SCRATCH.md
+*.scratch.*
+
+# Common editor / IDE state (kept here so this single file covers it all)
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -2,21 +2,22 @@
 
 Trains a QR-conditioned 3D voxel tree diffusion model using v-prediction.
 Training data is generated on-the-fly: each sample is a procedurally grown
-voxel tree placed inside a QR footprint.  The model learns to denoise a
-4-channel (RGB + occupancy) voxel grid conditioned on a 32x32 QR image and
-a tree-species theme index.
+voxel tree placed inside a QR footprint. The voxel grid size depends on the
+QR version (see qrbloom.qr.grid_shape_for_version). The model learns to
+denoise a 4-channel (RGB + occupancy) voxel grid conditioned on the QR
+footprint, a tree-species theme index, and three shape attributes.
 
 Losses (see qrbloom/diffusion.py p_losses):
   v_mse : v-prediction MSE over all 4 channels
   v_rgb : v-prediction MSE restricted to the RGB channels
   v_occ : v-prediction MSE restricted to the occupancy channel
 
-Outputs:
-  checkpoints/qrbloom.pt       — latest checkpoint
-  checkpoints/qrbloom_best.pt  — best validation checkpoint
-  runs/epoch_{N:03d}.png       — per-epoch sample montage
-  runs/epoch_{N:03d}.json      — per-epoch voxel data for the gallery
-  runs/loss.png                — training loss curve
+Outputs (with `VARIANT` env var suffix, e.g. VARIANT=_v2):
+  checkpoints/qrbloom{VARIANT}.pt       — latest checkpoint
+  checkpoints/qrbloom{VARIANT}_best.pt  — best validation checkpoint
+  runs{VARIANT}/epoch_{N:03d}.png       — per-epoch sample montage
+  runs{VARIANT}/epoch_{N:03d}.json      — per-epoch voxel data for the gallery
+  runs{VARIANT}/loss.png                — training loss curve
 """
 from __future__ import annotations
 
@@ -34,14 +35,14 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from qrbloom.diffusion import (UNet3D, Diffusion, EMA, Z_TREE_MIN, Z_TREE_MAX)
-from qrbloom.qr import (THEME_NAMES as DS_THEMES, QR_OFFSET as QR_OFF, QR_SIZE as QR_QE,
-                        QR_VERSION as QR_QV, GRID as GRID_N, random_qr_core, pad32)
+from qrbloom.diffusion import UNet3D, Diffusion, EMA, DOWNSCALE
+from qrbloom.qr import (THEME_NAMES as DS_THEMES, random_qr_core,
+                        qr_modules, grid_xy_for_version,
+                        grid_z_for_version, pad_to_grid)
 from qrbloom.treegen import THEMES as VTHEMES
 from qrbloom.treegen import generate_voxels_aug as generate_voxels, tree_attributes
 import json as _json
 import random as _random
-QR_CENTER = QR_QE // 2
 
 # ─── Distributed environment ──────────────────────────────────────────────────
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
@@ -75,6 +76,56 @@ VAL_SIZE = int(os.environ.get("VAL_SIZE", "2400"))         # fixed validation se
 VARIANT = os.environ.get("VARIANT", "")
 SUFFIX = VARIANT
 
+# Multi-version training: pick a QR version per sample from this set. The
+# diffusion model is fully convolutional in XY, so a single set of weights
+# handles all versions. To bound memory, training defaults to v1..v5
+# (XY up to 40). Set QR_VERSIONS="1,2,3,5,10" to widen the range.
+def _parse_versions(s: str) -> list[int]:
+    out = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.append(int(tok))
+    if not out:
+        raise ValueError("QR_VERSIONS must contain at least one version")
+    return out
+
+QR_VERSIONS = _parse_versions(os.environ.get("QR_VERSIONS", "2,3,4,5"))
+QR_VERSIONS_VAL = _parse_versions(os.environ.get("QR_VERSIONS_VAL",
+                                                  os.environ.get("QR_VERSIONS", "2,3,4,5")))
+
+
+def _parse_weights(s: str, versions: list[int]) -> list[float]:
+    """Per-version sampling weights for the training dataset.
+
+    Smaller QR versions are a harder learning problem (less voxel footprint,
+    fewer dark modules), so when training on a mix of versions the default
+    tilts sampling toward them: weight = (max_v - v + 1). For versions
+    [2,3,4,5] that gives [4,3,2,1] → roughly 40/30/20/10% of the batch.
+    Override with QR_VERSION_WEIGHTS="w_v2,w_v3,..." in the env.
+    Single-version training simply sets weights=[1.0].
+    """
+    if not s:
+        max_v = max(versions)
+        return [float(max_v - v + 1) for v in versions]
+    ws = [float(x.strip()) for x in s.split(",") if x.strip()]
+    if len(ws) != len(versions):
+        raise ValueError(f"QR_VERSION_WEIGHTS must have {len(versions)} values "
+                         f"(one per QR_VERSIONS entry), got {len(ws)}")
+    if any(w < 0 for w in ws):
+        raise ValueError("QR_VERSION_WEIGHTS must be non-negative")
+    if sum(ws) <= 0:
+        raise ValueError("QR_VERSION_WEIGHTS must sum to > 0")
+    return ws
+
+
+QR_VERSION_WEIGHTS = _parse_weights(os.environ.get("QR_VERSION_WEIGHTS", ""),
+                                     QR_VERSIONS)
+# Largest XY/Z the trainer may see — informational, used in startup log only.
+MAX_XY = max(grid_xy_for_version(v) for v in (QR_VERSIONS + QR_VERSIONS_VAL))
+MAX_Z  = max(grid_z_for_version(v)  for v in (QR_VERSIONS + QR_VERSIONS_VAL))
+
 _AMP_TH = torch.bfloat16 if AMP_DTYPE == "bf16" else torch.float16
 
 if torch.cuda.is_available():
@@ -89,8 +140,11 @@ LOSS_KEYS = ("v_mse", "v_rgb", "v_occ")
 class LiveTreeDataset(torch.utils.data.Dataset):
     """Dataset that generates a fresh (QR, theme, augmentation) sample on every access.
 
-    No data is stored on disk; ground truth is procedural, so the training set
-    is effectively unlimited.
+    Each sample is built for a random QR version drawn from `versions`. The
+    voxel grid's XY *and Z* size both depend on the version (isotropic
+    scaling — see qrbloom.qr.grid_z_for_version). The custom collate
+    (`pad_collate`) pads a mixed-version batch to the largest XY and Z in
+    the batch so DataLoader can stack tensors.
 
     deterministic=False (train): each sample uses system entropy — no repeats.
     deterministic=True  (val):   each index maps to a fixed seed — reproducible.
@@ -98,44 +152,112 @@ class LiveTreeDataset(torch.utils.data.Dataset):
     Returns: (occ_u8, rgb_u8, qr_u8, theme_idx, attr)
     """
 
-    def __init__(self, virtual_len, deterministic, seed=0):
+    def __init__(self, virtual_len, versions, deterministic, seed=0, weights=None):
         self.virtual_len = int(virtual_len)
+        self.versions = list(versions)
+        # weights=None → uniform sampling (used for val so the metric is
+        # version-balanced). Train passes per-version weights to oversample
+        # the harder lower QR versions.
+        self.weights = list(weights) if weights is not None else None
         self.deterministic = deterministic
         self.seed = seed
 
     def __len__(self):
         return self.virtual_len
 
-    def __getitem__(self, idx):
+    def _rng(self, idx):
         if self.deterministic:
             s = (self.seed * 1000003 + idx) & 0x7FFFFFFF
-            rng = _random.Random(s)
-            nprng = np.random.default_rng(s)
+            return _random.Random(s), np.random.default_rng(s)
+        return _random.Random(), np.random.default_rng()
+
+    def __getitem__(self, idx):
+        rng, nprng = self._rng(idx)
+        if self.weights is None:
+            version = self.versions[rng.randint(0, len(self.versions) - 1)]
         else:
-            rng = _random.Random()
-            nprng = np.random.default_rng()
-        core = random_qr_core(nprng)                # (QE, QE) uint8
+            version = rng.choices(self.versions, weights=self.weights, k=1)[0]
+        qe = qr_modules(version)
+        gxy = grid_xy_for_version(version)
+        gz  = grid_z_for_version(version)
+        off = (gxy - qe) // 2
+        ctr = qe // 2
+
+        core = random_qr_core(nprng, version=version)         # (qe, qe) uint8
         ti = rng.randint(0, len(DS_THEMES) - 1)
         voxels = generate_voxels(core.tolist(), theme=DS_THEMES[ti], rng=rng)
-        occ = np.zeros((GRID_N, GRID_N, GRID_N), dtype=np.uint8)
-        rgb = np.zeros((3, GRID_N, GRID_N, GRID_N), dtype=np.uint8)
+
+        occ = np.zeros((gxy, gxy, gz), dtype=np.uint8)
+        rgb = np.zeros((3, gxy, gxy, gz), dtype=np.uint8)
         for v in voxels:
             if v["is_base"]:
                 continue
             x, y, z = v["pos"]
-            i = QR_OFF + int(round(z)) + QR_CENTER
-            j = QR_OFF + int(round(x)) + QR_CENTER
+            i = off + int(round(z)) + ctr
+            j = off + int(round(x)) + ctr
             k = int(round(y))
-            if 0 <= i < GRID_N and 0 <= j < GRID_N and 0 <= k < GRID_N:
+            if 0 <= i < gxy and 0 <= j < gxy and 0 <= k < gz:
                 occ[i, j, k] = 1
                 h = v["color"].lstrip("#")
                 rgb[0, i, j, k] = int(h[0:2], 16)
                 rgb[1, i, j, k] = int(h[2:4], 16)
                 rgb[2, i, j, k] = int(h[4:6], 16)
-        qr = pad32(core)
-        attr = np.array(tree_attributes(voxels), dtype=np.float32)  # (3,) height, fullness, width
+        qr, _ = pad_to_grid(core, grid_xy=gxy)
+        attr = np.array(tree_attributes(voxels, qr_side=qe), dtype=np.float32)
         return (torch.from_numpy(occ), torch.from_numpy(rgb),
-                torch.from_numpy(qr), ti, torch.from_numpy(attr))
+                torch.from_numpy(qr), ti, torch.from_numpy(attr),
+                int(version))
+
+
+def pad_collate(batch):
+    """Collate items of varying XY/Z by zero-padding to the largest in the batch.
+
+    XY padding is symmetric around the QR center; Z padding is one-sided
+    (extend upward) so the QR base plane stays at z=0. Both XY and Z are
+    rounded up to multiples of DOWNSCALE so the U-Net can up/down cleanly.
+
+    Input shapes per sample:
+      occ : (gxy, gxy, gz)
+      rgb : (3, gxy, gxy, gz)
+      qr  : (gxy, gxy)              — 2D footprint, no Z
+    """
+    occs, rgbs, qrs, ths, attrs, vers = zip(*batch)
+    max_xy = max(o.shape[0] for o in occs)
+    max_z  = max(o.shape[2] for o in occs)
+    max_xy = ((max_xy + DOWNSCALE - 1) // DOWNSCALE) * DOWNSCALE
+    max_z  = ((max_z  + DOWNSCALE - 1) // DOWNSCALE) * DOWNSCALE
+
+    def _pad_occ(t: torch.Tensor) -> torch.Tensor:
+        # (D, H, W) — pad W (Z) one-sided, D/H symmetric.
+        D, H, W = t.shape
+        pz = max_z - W
+        pad_d_l = (max_xy - D) // 2; pad_d_r = (max_xy - D) - pad_d_l
+        pad_h_l = (max_xy - H) // 2; pad_h_r = (max_xy - H) - pad_h_l
+        # F.pad order for 3D tensor: (W_l, W_r, H_l, H_r, D_l, D_r)
+        return F.pad(t, (0, pz, pad_h_l, pad_h_r, pad_d_l, pad_d_r))
+
+    def _pad_rgb(t: torch.Tensor) -> torch.Tensor:
+        # (C, D, H, W)
+        _, D, H, W = t.shape
+        pz = max_z - W
+        pad_d_l = (max_xy - D) // 2; pad_d_r = (max_xy - D) - pad_d_l
+        pad_h_l = (max_xy - H) // 2; pad_h_r = (max_xy - H) - pad_h_l
+        return F.pad(t, (0, pz, pad_h_l, pad_h_r, pad_d_l, pad_d_r))
+
+    def _pad_qr(t: torch.Tensor) -> torch.Tensor:
+        # (D, H)
+        D, H = t.shape
+        pad_d_l = (max_xy - D) // 2; pad_d_r = (max_xy - D) - pad_d_l
+        pad_h_l = (max_xy - H) // 2; pad_h_r = (max_xy - H) - pad_h_l
+        return F.pad(t, (pad_h_l, pad_h_r, pad_d_l, pad_d_r))
+
+    occ_b = torch.stack([_pad_occ(o) for o in occs], 0)
+    rgb_b = torch.stack([_pad_rgb(r) for r in rgbs], 0)
+    qr_b = torch.stack([_pad_qr(q) for q in qrs], 0)
+    th_b = torch.tensor(list(ths), dtype=torch.long)
+    attr_b = torch.stack(list(attrs), 0)
+    ver_b = torch.tensor(list(vers), dtype=torch.long)
+    return occ_b, rgb_b, qr_b, th_b, attr_b, ver_b
 
 
 def log(*args, **kwargs):
@@ -158,6 +280,7 @@ def render_montage(occ_bin: np.ndarray, rgb: np.ndarray, qrs: np.ndarray,
     """Render a 3D scatter + top-down overlay for each sample in the batch."""
     import matplotlib.pyplot as plt
     B = min(occ_bin.shape[0], 9)
+    D, H, W = occ_bin.shape[1], occ_bin.shape[2], occ_bin.shape[3]
     fig = plt.figure(figsize=(B * 2.0, 5.0))
     for i in range(B):
         ax = fig.add_subplot(2, B, i + 1, projection="3d")
@@ -165,7 +288,7 @@ def render_montage(occ_bin: np.ndarray, rgb: np.ndarray, qrs: np.ndarray,
         if rs.size:
             cols_rgb = (np.transpose(rgb[i], (1, 2, 3, 0))[rs, cs, hs] * 0.5 + 0.5).clip(0, 1)
             ax.scatter(cs, rs, hs, c=cols_rgb, s=8, marker="s", depthshade=False)
-        ax.set_xlim(0, 32); ax.set_ylim(0, 32); ax.set_zlim(0, 32)
+        ax.set_xlim(0, D); ax.set_ylim(0, H); ax.set_zlim(0, W)
         ax.set_box_aspect((1, 1, 1))
         ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
         ax.set_title(f"{THEMES[themes[i]]}\nn={occ_bin[i].sum()}", fontsize=7)
@@ -198,12 +321,18 @@ def _safe_save(state: dict, path: Path) -> None:
 
 
 def _normalize_batch(occ_u8, rgb_u8, qr_u8, device):
-    """Convert uint8 tensors to normalized x0. Axes: (B, C, D=row, H=col, W=height)."""
+    """Convert uint8 tensors to normalized x0. Axes: (B, C, D=row, H=col, W=height).
+
+    qr_u8 shape is (B, D, H); the conditioning tensor is broadcast along W
+    (Z axis) so the QR footprint repeats up the whole height — matching
+    `occ_u8` whose W came from the dataset's per-version grid_z.
+    """
     occ = occ_u8.to(device, non_blocking=True).float().mul_(2.0).sub_(1.0)
     rgb = rgb_u8.to(device, non_blocking=True).float().mul_(1 / 127.5).sub_(1.0)
     qr = qr_u8.to(device, non_blocking=True).float()
     x0 = torch.cat([rgb, occ.unsqueeze(1)], dim=1)
-    cond = qr.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, 32).contiguous()
+    W = x0.shape[-1]
+    cond = qr.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, W).contiguous()
     return x0, cond
 
 
@@ -224,12 +353,13 @@ def evaluate(model, diff, loader, device) -> dict:
     n_batches = 0
     t_probe = max(1, T // 10)
     with torch.no_grad():
-        for occ_u8, rgb_u8, qr_u8, th, attr in loader:
+        for occ_u8, rgb_u8, qr_u8, th, attr, ver in loader:
             x0, cond = _normalize_batch(occ_u8, rgb_u8, qr_u8, device)
             theme = th.to(device, non_blocking=True)
             attr = attr.to(device, non_blocking=True)
+            ver = ver.to(device, non_blocking=True)
             with torch.amp.autocast("cuda", dtype=_AMP_TH):
-                loss, info = diff.p_losses(model, x0, cond, theme, attr)
+                loss, info = diff.p_losses(model, x0, cond, theme, attr, version=ver)
             for k, v in info.items():
                 parts_sum[k] += v.item()
             parts_sum["total"] += loss.item()
@@ -239,7 +369,7 @@ def evaluate(model, diff, loader, device) -> dict:
             xt = diff.q_sample(x0, tb, noise)
             am = torch.ones(x0.size(0), device=device)
             with torch.amp.autocast("cuda", dtype=_AMP_TH):
-                v_pred = _unwrap(model)(xt, tb, cond, theme, attr, am)
+                v_pred = _unwrap(model)(xt, tb, cond, theme, attr, am, ver)
             x0_pred = diff.x0_from_v(xt, tb, v_pred.float())
             occ_pred = (x0_pred[:, 3] > 0).float()
             occ_gt = (x0[:, 3] > 0).float()
@@ -268,18 +398,22 @@ def evaluate(model, diff, loader, device) -> dict:
     return parts_sum
 
 
-def save_epoch_json(ep, occ, rgb_pred, qrs_np, theme_np, path):
+def save_epoch_json(ep, occ, rgb_pred, qrs_np, theme_np, path, version):
     """Write a gallery-compatible JSON file for the given epoch's samples."""
+    qe = qr_modules(version)
+    gxy = qrs_np.shape[1]                # padded XY grid edge
+    off = (gxy - qe) // 2
+    ctr = qe // 2
     samples = []
     for idx in range(len(occ)):
         theme = DS_THEMES[int(theme_np[idx])]
         th = VTHEMES[theme]
         cells = []
-        core = qrs_np[idx][QR_OFF:QR_OFF + QR_QE, QR_OFF:QR_OFF + QR_QE]
-        for i in range(QR_QE):
-            for j in range(QR_QE):
+        core = qrs_np[idx][off:off + qe, off:off + qe]
+        for i in range(qe):
+            for j in range(qe):
                 col_hex = th["qr_dark"] if core[i, j] else th["qr_light"]
-                cells.append([int(j - QR_CENTER), 0, int(i - QR_CENTER), 1.0, col_hex])
+                cells.append([int(j - ctr), 0, int(i - ctr), 1.0, col_hex])
         rs, cs, hs = np.where(occ[idx])
         for r, c, k in zip(rs, cs, hs):
             if k < 1:
@@ -288,12 +422,12 @@ def save_epoch_json(ep, occ, rgb_pred, qrs_np, theme_np, path):
             gg = int(np.clip((rgb_pred[idx, 1, r, c, k] + 1) * 127.5, 0, 255))
             bb = int(np.clip((rgb_pred[idx, 2, r, c, k] + 1) * 127.5, 0, 255))
             color = f"#{rr:02x}{gg:02x}{bb:02x}"
-            x = int(c - (QR_OFF + QR_CENTER))
-            z = int(r - (QR_OFF + QR_CENTER))
+            x = int(c - (off + ctr))
+            z = int(r - (off + ctr))
             cells.append([x, int(k), z, 1.0, color])
         samples.append({"theme": theme, "cells": cells, "count": len(cells)})
     with open(path, "w") as f:
-        _json.dump({"ep": ep, "samples": samples}, f)
+        _json.dump({"ep": ep, "version": version, "samples": samples}, f)
 
 
 def save_loss_curve(hist, path):
@@ -313,20 +447,26 @@ def save_loss_curve(hist, path):
     plt.close(fig)
 
 
-def sample_montage(diff, ema, mont_batch, ep, png_path, device, json_path=None):
+def sample_montage(diff, ema, mont_batch, mont_version, ep, png_path, device,
+                   json_path=None):
     """Sample the EMA model stochastically for each theme and write PNG + JSON."""
-    m_eval = UNet3D(ch=48, n_themes=len(DS_THEMES)).to(device)
+    m_eval = UNet3D(ch=48, n_themes=len(DS_THEMES), versions=tuple(QR_VERSIONS)).to(device)
     ema.copy_to(m_eval)
     m_eval.eval()
     occ_u8, rgb_u8, qr_u8, th = mont_batch
     qr = qr_u8.float().to(device)
-    cond = qr.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, 32).contiguous()
+    # Montage uses the mont_version-specific Z extent so the sampled grid
+    # matches the data distribution at that version.
+    mont_gz = grid_z_for_version(mont_version)
+    cond = qr.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, mont_gz).contiguous()
     theme = th.to(device)
     # Use mid-range attributes [0.5, 0.5, 0.5] to visualize an average tree shape.
     attr = torch.full((th.size(0), 3), 0.5, device=device)
+    # All montage samples share the same QR version so we pass a scalar-broadcast.
+    ver = torch.full((th.size(0),), int(mont_version), device=device, dtype=torch.long)
     with torch.no_grad():
         x = diff.sample(m_eval, cond, theme, attr=attr, steps=SAMPLE_STEPS,
-                        device=device, eta=1.0).cpu().numpy()
+                        device=device, eta=1.0, version=ver).cpu().numpy()
     occ = (x[:, 3] > 0)
     qr_np = qr_u8.numpy()
     qr_mask = (qr_np > 0)[:, :, :, None]
@@ -335,7 +475,8 @@ def sample_montage(diff, ema, mont_batch, ep, png_path, device, json_path=None):
     th_np = th.numpy()
     render_montage(occ, rgb, qr_np, th_np, png_path)
     if json_path is not None:
-        save_epoch_json(ep, occ.astype(np.float32), rgb, qr_np, th_np, json_path)
+        save_epoch_json(ep, occ.astype(np.float32), rgb, qr_np, th_np, json_path,
+                        version=mont_version)
     del m_eval
     torch.cuda.empty_cache()
 
@@ -348,9 +489,15 @@ def main():
         dist.barrier()
 
     # Training samples are generated live; validation uses a fixed seed for reproducibility.
-    train_ds = LiveTreeDataset(EPOCH_SIZE, deterministic=False)
-    val_ds = LiveTreeDataset(VAL_SIZE, deterministic=True, seed=999)
-    log(f"[data] live generation — epoch_size={EPOCH_SIZE} val={VAL_SIZE}")
+    train_ds = LiveTreeDataset(EPOCH_SIZE, versions=QR_VERSIONS, deterministic=False,
+                                weights=QR_VERSION_WEIGHTS)
+    val_ds = LiveTreeDataset(VAL_SIZE, versions=QR_VERSIONS_VAL, deterministic=True, seed=999)
+    _w_sum = sum(QR_VERSION_WEIGHTS) or 1.0
+    _w_pct = [f"v{v}:{100*w/_w_sum:.0f}%" for v, w in zip(QR_VERSIONS, QR_VERSION_WEIGHTS)]
+    log(f"[data] live generation — epoch_size={EPOCH_SIZE} val={VAL_SIZE}  "
+        f"train_versions={QR_VERSIONS}  val_versions={QR_VERSIONS_VAL}  "
+        f"max_xy={MAX_XY}  max_z={MAX_Z}")
+    log(f"[data] train weights — {' '.join(_w_pct)}  (raw={QR_VERSION_WEIGHTS})")
 
     if IS_DIST:
         train_sampler = DistributedSampler(train_ds, num_replicas=WORLD_SIZE,
@@ -361,7 +508,7 @@ def main():
         train_sampler = None
         val_sampler = None
 
-    _dl_kw = dict(num_workers=WORKERS, pin_memory=True)
+    _dl_kw = dict(num_workers=WORKERS, pin_memory=True, collate_fn=pad_collate)
     if WORKERS > 0:
         _dl_kw.update(persistent_workers=True, prefetch_factor=4)
     train_dl = DataLoader(train_ds, batch_size=BATCH, sampler=train_sampler,
@@ -373,72 +520,92 @@ def main():
         f"global_batch={BATCH * WORLD_SIZE}")
 
     # Build 9 unseen QR codes (one per theme) for the per-epoch sample montage.
+    # Versions are sampled from QR_VERSIONS_VAL so the montage exercises the
+    # multi-version code path. All 9 codes share the SAME version per epoch so
+    # they stack into one batch tensor.
     mont_batch = None
+    mont_version = None
     if IS_MAIN:
         import segno, random
         import string
         rng = random.Random(20260520)
         url_chars = string.ascii_lowercase + string.digits + "-."
-        v1_chars = string.ascii_letters + string.digits
+        alnum_chars = string.ascii_letters + string.digits
         PORTFOLIO_URL = os.environ.get("DEMO_URL", "https://example.com")
+        # Pick a version (rotates each restart via the seed); the same version
+        # is used for all 9 montage samples.
+        mont_version = QR_VERSIONS_VAL[rng.randint(0, len(QR_VERSIONS_VAL) - 1)]
+        m_qe = qr_modules(mont_version)
+        m_gxy = grid_xy_for_version(mont_version)
+        m_gz  = grid_z_for_version(mont_version)
+        m_off = (m_gxy - m_qe) // 2
+
         unseen_qrs, unseen_texts = [], []
         for t in range(9):
-            if QR_QV >= 3 and t == 5:
+            if mont_version >= 3 and t == 5:
                 text = PORTFOLIO_URL
             else:
                 while True:
-                    if QR_QV == 1:
+                    if mont_version == 1:
                         n = rng.randint(6, 16)
-                        text = "".join(rng.choices(v1_chars, k=n))
+                        text = "".join(rng.choices(alnum_chars, k=n))
                     else:
-                        n = rng.randint(8, 40)
+                        n = rng.randint(8, min(40, m_qe))
                         if rng.random() < 0.5 and n >= 12:
-                            text = "https://" + "".join(rng.choices(url_chars, k=n-8))
+                            text = "https://" + "".join(rng.choices(url_chars, k=n - 8))
                         else:
                             text = "".join(rng.choices(url_chars, k=n))
                     try:
-                        qr = segno.make(text, error="m", version=QR_QV); break
+                        segno.make(text, error="m", version=mont_version); break
                     except Exception:
                         continue
-            qr = segno.make(text, error="m", version=QR_QV)
-            core = np.array([[1 if c else 0 for c in row] for row in qr.matrix], dtype=np.uint8)
-            pad = np.zeros((32, 32), dtype=np.uint8)
-            pad[QR_OFF:QR_OFF + QR_QE, QR_OFF:QR_OFF + QR_QE] = core
+            qr = segno.make(text, error="m", version=mont_version)
+            core = np.array([[1 if c else 0 for c in row] for row in qr.matrix],
+                            dtype=np.uint8)
+            pad = np.zeros((m_gxy, m_gxy), dtype=np.uint8)
+            pad[m_off:m_off + m_qe, m_off:m_off + m_qe] = core
             unseen_qrs.append(pad); unseen_texts.append(text)
         unseen_qrs = np.stack(unseen_qrs)
         mont_batch = (
-            torch.zeros(9, 32, 32, 32, dtype=torch.uint8),
-            torch.zeros(9, 3, 32, 32, 32, dtype=torch.uint8),
+            torch.zeros(9, m_gxy, m_gxy, m_gz, dtype=torch.uint8),
+            torch.zeros(9, 3, m_gxy, m_gxy, m_gz, dtype=torch.uint8),
             torch.from_numpy(unseen_qrs),
             torch.arange(9, dtype=torch.long),
         )
-        log(f"[montage] unseen QRs (version={QR_QV}) — texts: {unseen_texts}")
+        log(f"[montage] unseen QRs (version={mont_version}, "
+            f"grid={m_gxy}x{m_gxy}x{m_gz}) — texts: {unseen_texts}")
 
         from qrbloom.treegen import generate_voxels
         gt_samples = []
         for i in range(9):
             theme_name = DS_THEMES[i]
-            qr = segno.make(unseen_texts[i], error="m", version=QR_QV)
+            qr = segno.make(unseen_texts[i], error="m", version=mont_version)
             core_bool = [[bool(c) for c in row] for row in qr.matrix]
             voxels = generate_voxels(core_bool, theme=theme_name)
             cells = [[int(v["pos"][0]), int(v["pos"][1]), int(v["pos"][2]),
                       float(v["scale"]), v["color"]] for v in voxels]
             gt_samples.append({"theme": theme_name, "text": unseen_texts[i],
+                               "version": mont_version,
                                "cells": cells, "count": len(cells)})
         with open(str(OUT_DIR / f"unseen_gt{SUFFIX}.json"), "w") as f:
-            _json.dump({"samples": gt_samples}, f)
+            _json.dump({"version": mont_version,
+                        "trained_versions": sorted(set(QR_VERSIONS)),
+                        "val_versions": sorted(set(QR_VERSIONS_VAL)),
+                        "samples": gt_samples}, f)
         log("[montage] saved ground-truth JSON")
 
     # ─── Model ────────────────────────────────────────────────────────────────
-    base_model = UNet3D(ch=48, n_themes=len(DS_THEMES)).to(DEVICE)
+    base_model = UNet3D(ch=48, n_themes=len(DS_THEMES), versions=tuple(QR_VERSIONS)).to(DEVICE)
     n_params = sum(p.numel() for p in base_model.parameters())
     log(f"[model] UNet3D params={n_params/1e6:.2f}M")
     diff = Diffusion(T=T, device=DEVICE)
     ema = EMA(base_model, decay=0.999)
 
     if IS_DIST:
+        # MoE heads dispatch per-version: heads without samples on this step
+        # get no grad, so DDP must tolerate unused params.
         model = DDP(base_model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK,
-                    find_unused_parameters=False)
+                    find_unused_parameters=True)
     else:
         model = base_model
 
@@ -489,17 +656,18 @@ def main():
         epoch_parts["total"] = 0.0
         pbar = tqdm(train_dl, desc=f"ep{ep:03d}", dynamic_ncols=True, disable=not IS_MAIN)
         n_batches = 0
-        for occ_b, rgb_b, qr_b, th_b, attr_b in pbar:
+        for occ_b, rgb_b, qr_b, th_b, attr_b, ver_b in pbar:
             lr = lr_at(cur_step, total_steps)
             for pg in opt.param_groups: pg["lr"] = lr
 
             x0, cond = _normalize_batch(occ_b, rgb_b, qr_b, DEVICE)
             theme = th_b.to(DEVICE, non_blocking=True)
             attr = attr_b.to(DEVICE, non_blocking=True)
+            ver = ver_b.to(DEVICE, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=_AMP_TH):
-                loss, info = diff.p_losses(model, x0, cond, theme, attr)
+                loss, info = diff.p_losses(model, x0, cond, theme, attr, version=ver)
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -557,7 +725,8 @@ def main():
         if IS_MAIN:
             png = str(OUT_DIR / f"epoch_{ep:03d}.png")
             epoch_json = str(OUT_DIR / f"epoch_{ep:03d}.json")
-            sample_montage(diff, ema, mont_batch, ep, png, DEVICE, json_path=epoch_json)
+            sample_montage(diff, ema, mont_batch, mont_version, ep, png, DEVICE,
+                           json_path=epoch_json)
             save_loss_curve(hist, str(OUT_DIR / "loss.png"))
             log(f"ep{ep:03d} loss={epoch_parts['total']:.4f} "
                 f"v_rgb={epoch_parts['v_rgb']:.4f} v_occ={epoch_parts['v_occ']:.4f}")
