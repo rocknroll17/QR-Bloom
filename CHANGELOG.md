@@ -1,9 +1,9 @@
 # Changelog
 
-## [1.2.0](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.6...v1.2.0) (2026-05-27)
+## [1.1.7](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.6...v1.1.7) (2026-05-27)
 
 
-### Features
+### Bug Fixes
 
 * **treegen:** slim palm trunk + truncated-normal augmentation ([#31](https://github.com/rocknroll17/QR-Bloom/issues/31)) ([4a83bcb](https://github.com/rocknroll17/QR-Bloom/commit/4a83bcb435ee7d57d182958b33f759cd71bd9fcc))
 
