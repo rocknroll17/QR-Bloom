@@ -24,23 +24,15 @@ import segno
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from qrbloom.qr import grid_xy_for_version, pad_to_grid  # noqa: E402
-from qrbloom.treegen import THEMES, generate_voxels  # noqa: E402
+from qrbloom.treegen import LABELS, THEMES, generate_voxels  # noqa: E402
+
 OUT_DIR = REPO_ROOT / "docs" / "samples"
 
-# Human-readable theme labels.
-THEME_LABELS = {
-    "cherryblossom": "Cherry blossom",
-    "pine": "Pine",
-    "socotra": "Dragon tree (Socotra)",
-    "maple": "Maple",
-    "baobab": "Baobab",
-    "willow": "Willow",
-    "magnolia": "Magnolia",
-    "saguaro_cactus": "Saguaro cactus",
-    "palm": "Palm",
-    "acacia": "Acacia",
-}
+
+def theme_label(theme: str) -> str:
+    """Human-readable label — sourced from qrbloom.treegen.LABELS with a
+    title-cased fallback so newly added themes don't break the build."""
+    return LABELS.get(theme, theme.replace("_", " ").title())
 
 # One QR text per theme so the demo has variety. Kept short enough that segno
 # fits each into QR version 2 (35 alphanumeric chars at error level M).
@@ -62,11 +54,9 @@ SEED_BASE = 20260101
 
 
 def encode_qr(text: str, version: int = 2) -> np.ndarray:
-    """Encode text as a QR matrix and pad to the model's grid."""
+    """Encode text as a QR matrix (unpadded core, matching the gallery's input)."""
     qr = segno.make(text, error="m", version=version)
-    core = np.array(qr.matrix, dtype=np.uint8)
-    full, _ = pad_to_grid(core, grid_xy=grid_xy_for_version(version))
-    return full
+    return np.array(qr.matrix, dtype=np.uint8)
 
 
 def voxels_to_cells(voxels: list[dict]) -> list[list]:
@@ -83,7 +73,7 @@ def build_sample(theme: str, text: str, version: int, seed: int) -> dict:
     rng = random.Random(seed)
     voxels = generate_voxels(qr, theme=theme, rng=rng)
     return {
-        "label": THEME_LABELS[theme],
+        "label": theme_label(theme),
         "theme": theme,
         "text": text,
         "version": version,
@@ -103,7 +93,7 @@ def main() -> None:
         out_path.write_text(json.dumps(sample, separators=(",", ":")))
         manifest_themes.append({
             "name": theme,
-            "label": THEME_LABELS[theme],
+            "label": theme_label(theme),
             "file": f"samples/{theme}.json",
         })
         print(f"  wrote {out_path.relative_to(REPO_ROOT)} ({len(sample['cells'])} cells)")

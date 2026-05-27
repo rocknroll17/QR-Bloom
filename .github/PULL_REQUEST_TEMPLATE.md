@@ -10,6 +10,6 @@
 sample command and the result; for UI changes attach a screenshot or GIF. -->
 
 ## Checklist
-- [ ] Followed conventions in `CLAUDE.md` (cell format, camera presets, folder layout)
-- [ ] Updated `COMMANDS.md` if a CLI/workflow changed
+- [ ] Followed existing repository conventions for cell format, camera presets, and folder layout
+- [ ] Updated relevant documentation and usage examples if a CLI/workflow changed
 - [ ] No model checkpoints, large binaries, or local-only paths committed
