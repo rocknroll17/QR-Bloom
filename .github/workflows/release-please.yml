@@ -16,6 +16,10 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    # release-please-action@v4 still ships on Node 20; force Node 24 to silence
+    # the runner deprecation warning until the action publishes its own bump.
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
     steps:
       - uses: googleapis/release-please-action@v4
         with:
