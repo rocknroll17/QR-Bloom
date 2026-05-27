@@ -18,7 +18,7 @@
 # Override the host port (gallery listens on whatever --port is passed):
 #   docker run -d -p 9000:9000 -v "$(pwd):/app" qrbloom python gallery.py --port 9000
 
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # libgomp1: OpenMP runtime required by the PyTorch / NumPy backends.
 RUN apt-get update \
