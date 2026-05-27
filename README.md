@@ -10,8 +10,15 @@ A QR-conditioned 3D voxel diffusion model. It grows a 3D voxel tree whose
 top-down silhouette is a scannable QR code: viewed from the side it is a tree,
 viewed from above it is a working QR code.
 
-**[Live demo →](https://rocknroll17.github.io/QR-Bloom/)** — pick a theme,
-orbit the tree, then switch to the top-down view to scan the QR.
+### Try it
+
+- **[Try the trained model →](https://qr-bloom.rocknroll17.com/)**
+  Type a URL or short text, pick a theme, and the diffusion model renders
+  a fresh voxel tree on the fly. Tilt to top-down to scan the QR.
+- **[Procedural preview →](https://rocknroll17.github.io/QR-Bloom/)**
+  Static GitHub Pages demo — same renderer, but the trees are produced by
+  the procedural generator that the diffusion model is trained to reproduce.
+  No backend required.
 
 ![demo](assets/demo.gif)
 
