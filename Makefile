@@ -169,7 +169,7 @@ status: ## GPU usage + live trainings + latest val_total per version.
 	  --format=csv,noheader
 	@echo ""
 	@echo "── Trainings ────────────────────────────────"
-	@pgrep -af "python.*train.py" | grep -v claude || echo "  (no training running)"
+	@pgrep -af "python.*train.py" || echo "  (no training running)"
 	@echo ""
 	@echo "── Latest epoch per version ─────────────────"
 	@for V in 2 3 4 5; do \

@@ -1,8 +1,17 @@
 # QR-Bloom
 
+[![CodeQL](https://github.com/rocknroll17/QR-Bloom/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/rocknroll17/QR-Bloom/actions/workflows/codeql.yml)
+[![Pages](https://github.com/rocknroll17/QR-Bloom/actions/workflows/pages.yml/badge.svg?branch=main)](https://github.com/rocknroll17/QR-Bloom/actions/workflows/pages.yml)
+[![Docker](https://github.com/rocknroll17/QR-Bloom/actions/workflows/docker-publish.yml/badge.svg?branch=main)](https://github.com/rocknroll17/QR-Bloom/actions/workflows/docker-publish.yml)
+[![GHCR](https://img.shields.io/badge/ghcr.io-qr--bloom-2ea44f?logo=docker&logoColor=white)](https://github.com/rocknroll17/QR-Bloom/pkgs/container/qr-bloom)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A QR-conditioned 3D voxel diffusion model. It grows a 3D voxel tree whose
 top-down silhouette is a scannable QR code: viewed from the side it is a tree,
 viewed from above it is a working QR code.
+
+**[Live demo →](https://rocknroll17.github.io/QR-Bloom/)** — pick a theme,
+orbit the tree, then switch to the top-down view to scan the QR.
 
 ![demo](assets/demo.gif)
 
@@ -142,8 +151,12 @@ A prebuilt image is published to GitHub Container Registry on every push to `mai
 docker pull ghcr.io/rocknroll17/qr-bloom:latest
 ```
 
-Specific commits are tagged `sha-<short-sha>`. The image is public, so no
-`docker login` is required to pull.
+Available tags:
+- `latest` — most recent build on `main`
+- `vX.Y.Z` / `X.Y` / `X` — stable releases (e.g. `v1.1.0`, `1.1`, `1`)
+- `sha-<short-sha>` — pin to a specific commit
+
+The image is public, so no `docker login` is required to pull.
 
 ### Run the gallery (CPU)
 
