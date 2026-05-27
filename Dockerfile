@@ -34,6 +34,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Project code.
 COPY qrbloom/ ./qrbloom/
 COPY templates/ ./templates/
+# docs/ ships in full — gallery.py serves docs/qrbloom-viewer.js at runtime,
+# and copying the whole directory lets any future shared asset land in the
+# image automatically. The Pages-only samples/ folder is gitignored so it
+# never enters the build context.
+COPY docs/ ./docs/
 COPY train.py evaluate.py gallery.py ./
 
 ENV PYTHONUNBUFFERED=1
