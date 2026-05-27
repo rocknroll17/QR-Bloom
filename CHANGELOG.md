@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.5](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.4...v1.1.5) (2026-05-27)
+
+
+### Bug Fixes
+
+* **deploy:** retry docker pull while release.yml is still publishing ([#26](https://github.com/rocknroll17/QR-Bloom/issues/26)) ([eee2b9e](https://github.com/rocknroll17/QR-Bloom/commit/eee2b9efe0155a2b50e6b2976cc8db42e1a548a3))
+* **viewer:** restore right-click pan in tree mode ([#24](https://github.com/rocknroll17/QR-Bloom/issues/24)) ([4b44fbe](https://github.com/rocknroll17/QR-Bloom/commit/4b44fbe3b26d990f32f55d5e5501e05ec203ffa6))
+
 ## [1.1.4](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.3...v1.1.4) (2026-05-27)
 
 
