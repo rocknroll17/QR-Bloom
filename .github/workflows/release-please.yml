@@ -1,0 +1,24 @@
+name: release-please
+
+# Watches conventional commits on main. When fix:/feat:/etc. land, opens a
+# "chore(main): release X.Y.Z" PR with an auto-generated changelog. Merging
+# that PR pushes the vX.Y.Z tag and creates the GitHub Release — which then
+# triggers release.yml to build and publish the Docker image with semver tags.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
