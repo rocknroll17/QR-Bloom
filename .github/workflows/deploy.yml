@@ -1,0 +1,76 @@
+name: Deploy
+
+# Pushes a new image to the production server (qr-bloom.rocknroll17.com)
+# whenever a Release is published, or on-demand via workflow_dispatch.
+#
+# The server is expected to have:
+#   - Docker with the NVIDIA Container Toolkit (--gpus all works)
+#   - The deploy SSH key registered in ~/.ssh/authorized_keys
+#   - The checkpoints/ directory at DEPLOY_CHECKPOINTS_DIR
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to pull (e.g. v1.1.4, defaults to latest)'
+        required: false
+        default: 'latest'
+
+permissions:
+  contents: read
+
+# Only one production deploy can run at a time. If a deploy is in flight when
+# a newer release lands, finish the current one then run the new one.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://qr-bloom.rocknroll17.com/
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+            TAG="${{ github.event.inputs.tag || 'latest' }}"
+            IMAGE="ghcr.io/rocknroll17/qr-bloom:${TAG}"
+            CHECKPOINTS="${{ secrets.DEPLOY_CHECKPOINTS_DIR }}"
+
+            echo "==> Pulling ${IMAGE}"
+            docker pull "${IMAGE}"
+
+            echo "==> Stopping existing qrbloom-gallery (if any)"
+            docker rm -f qrbloom-gallery 2>/dev/null || true
+
+            echo "==> Stopping any other container holding host port 8001"
+            for c in $(docker ps --filter "publish=8001" -q); do
+              echo "    removing $c"
+              docker rm -f "$c" || true
+            done
+
+            echo "==> Starting new container from ${IMAGE}"
+            docker run -d \
+              --name qrbloom-gallery \
+              --restart unless-stopped \
+              --gpus all \
+              -p 8001:8000 \
+              -v "${CHECKPOINTS}:/app/checkpoints:ro" \
+              "${IMAGE}"
+
+            echo "==> Cleaning up dangling images"
+            docker image prune -f >/dev/null
+
+            echo "==> Status"
+            docker ps --filter name=qrbloom-gallery \
+              --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
