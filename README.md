@@ -2,7 +2,7 @@
 
 [![CodeQL](https://github.com/rocknroll17/QR-Bloom/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/rocknroll17/QR-Bloom/actions/workflows/codeql.yml)
 [![Pages](https://github.com/rocknroll17/QR-Bloom/actions/workflows/pages.yml/badge.svg?branch=main)](https://github.com/rocknroll17/QR-Bloom/actions/workflows/pages.yml)
-[![Docker](https://github.com/rocknroll17/QR-Bloom/actions/workflows/docker-publish.yml/badge.svg?branch=main)](https://github.com/rocknroll17/QR-Bloom/actions/workflows/docker-publish.yml)
+[![Release](https://github.com/rocknroll17/QR-Bloom/actions/workflows/release.yml/badge.svg)](https://github.com/rocknroll17/QR-Bloom/actions/workflows/release.yml)
 [![GHCR](https://img.shields.io/badge/ghcr.io-qr--bloom-2ea44f?logo=docker&logoColor=white)](https://github.com/rocknroll17/QR-Bloom/pkgs/container/qr-bloom)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -151,10 +151,12 @@ A prebuilt image is published to GitHub Container Registry on every push to `mai
 docker pull ghcr.io/rocknroll17/qr-bloom:latest
 ```
 
+Images are published only when a release is cut (a `v*` tag is pushed),
+so every pull lands on a tagged, changelog-backed build.
+
 Available tags:
-- `latest` — most recent build on `main`
-- `vX.Y.Z` / `X.Y` / `X` — stable releases (e.g. `v1.1.0`, `1.1`, `1`)
-- `sha-<short-sha>` — pin to a specific commit
+- `latest` — most recent release
+- `vX.Y.Z` / `X.Y.Z` / `X.Y` / `X` — stable releases (e.g. `v1.1.3`, `1.1.3`, `1.1`, `1`)
 
 The image is public, so no `docker login` is required to pull.
 
