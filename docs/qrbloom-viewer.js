@@ -119,7 +119,9 @@ export class Viewer {
     controls.target.fromArray(CAMERAS.tree.tgt);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
-    controls.enablePan = false;
+    // Pan stays on in tree mode (right-click drag); switchMode disables it
+    // while in QR mode so the top-down view stays centered.
+    controls.enablePan = true;
     controls.minDistance = 15;
     controls.maxDistance = 260;
     controls.maxPolarAngle = Math.PI / 2;
@@ -280,6 +282,7 @@ export class Viewer {
           this._isTransitioning = false;
           this.controls.enabled = true;
           this.controls.enableRotate = (this.mode === 'tree');
+          this.controls.enablePan = (this.mode === 'tree');
           this.camera.position.fromArray(this._lerpTo.pos);
           this.camera.up.fromArray(this._lerpTo.up).normalize();
           this.controls.target.fromArray(this._lerpTo.tgt);
