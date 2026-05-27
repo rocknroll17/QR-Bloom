@@ -214,183 +214,23 @@
 }}
 </script>
 <script type="module">
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { Viewer } from '/qrbloom-viewer.js';
 
-// Renderer: dpr capped at 1.5, antialias off, shadow map 1024 for performance.
-const renderer = new THREE.WebGLRenderer({
-  antialias: false,
-  preserveDrawingBuffer: true,
-  powerPreference: "high-performance",
-});
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
-renderer.setSize(innerWidth, innerHeight);
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.0;
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-document.body.appendChild(renderer.domElement);
+// Single shared viewer — same rendering code as the GitHub Pages demo.
+const viewer = new Viewer(document.body);
 
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xf8fafc);
-const pmrem = new THREE.PMREMGenerator(renderer);
-pmrem.compileEquirectangularShader();
-// Neutral studio lighting via RoomEnvironment (no external HDRI dependency).
-scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+let _embedCells = [];   // last cells passed to viewer.setCells — used by the embed feature
 
-// Orthographic camera: voxels at the same (x,z) collapse to the same pixel from
-// above, which produces a clean QR silhouette in QR mode.
-// halfSize controls the view extent: top/bottom = ±halfSize, left/right = ±halfSize*aspect.
-let orthoHalf = 24;
-const camera = new THREE.OrthographicCamera(
-  -orthoHalf * innerWidth/innerHeight, orthoHalf * innerWidth/innerHeight,
-  orthoHalf, -orthoHalf, 0.1, 500
-);
-camera.position.set(45, 20, 45);
-camera.up.set(0, 1, 0);
-
-const TARGETS = {
-  tree: { pos: [45, 20, 45], tgt: [0, 14, 0], up: [0, 1, 0], halfSize: 24 },
-  qr:   { pos: [0, 100, 0],  tgt: [0, 0, 0],  up: [0, 0, -1], halfSize: 16.5 },
-};
-let MODE = "tree";
-let lerpTo = TARGETS.tree;
-let isTransitioning = false;
-let transitionFrames = 0;
-// blendFactor: 0 = tree colors, 1 = QR colors. Lerped toward targetBlend each frame.
-let blendFactor = 0;
-let targetBlend = 0;
-const _posT = new THREE.Vector3();
-const _tgtT = new THREE.Vector3();
-const _upT  = new THREE.Vector3();
-const _tmpColor = new THREE.Color();
-// Directional light fades toward 0 in QR mode to flatten the shading.
-const DIR_BASE_INTENSITY = 1.2;
-
-// Per-theme QR colors used in QR mode to recolor tree voxels.
-// Per-theme QR colors — populated from /api/themes on load (sourced from the generator).
-let THEME_QR = {};
-
-const amb = new THREE.AmbientLight(0xffffff, 0.6);
-scene.add(amb);
-const dir = new THREE.DirectionalLight(0xffffff, DIR_BASE_INTENSITY);
-dir.position.set(20, 30, 20); dir.castShadow = true;
-dir.shadow.mapSize.set(1024, 1024);
-dir.shadow.camera.left=-30; dir.shadow.camera.right=30;
-dir.shadow.camera.top=30; dir.shadow.camera.bottom=-30;
-dir.shadow.camera.near=1; dir.shadow.camera.far=100;
-dir.shadow.bias=-0.0002; dir.shadow.normalBias=0.02;
-scene.add(dir);
-
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 14, 0);
-controls.enableDamping = true; controls.dampingFactor = 0.08;
-controls.minDistance = 15; controls.maxDistance = 260;
-controls.maxPolarAngle = Math.PI / 2;
-// rotateSpeed is adjusted dynamically in animate() — reduced near the top to avoid azimuth twisting.
-
-// Turntable: the tree group spins in place while the camera stays fixed, so
-// mode transitions always start from the same canonical camera angle.
-let turntable = 0;
-const TURNTABLE_SPEED = 0.006;
-// Hook for the demo capture: reset the turntable to a known angle.
-window.__resetTurntable = () => { turntable = 0; };
-
-const boxGeo = new THREE.BoxGeometry(1, 1, 1);
-
-const root = new THREE.Group(); scene.add(root);
-// Per-mesh color pairs (tree color, QR color) — lerped by blendFactor each frame.
-let meshInstances = [];   // [{mesh, items: [{treeCol, qrCol}]}]
-
-function clearRoot(){
-  while (root.children.length) {
-    const c = root.children[0]; root.remove(c);
-    c.traverse(o => {
-      if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => m.dispose());
-    });
-  }
-  meshInstances = [];
-}
-
-let _embedCells = [];   // last cells passed to setCells — used by the embed feature
-
-function setCells(cells, themeName){
+function showCells(cells) {
   _embedCells = cells || [];
-  clearRoot();
-  if (!cells || !cells.length) return;
-  const theme = THEME_QR[themeName] || { dark: "#222", light: "#eee" };
-
-  // QR color under each (x,z) column — taken from the base layer (y=0). Tree
-  // voxels blend to this so the top-down view matches the QR plane exactly.
-  const qrUnder = new Map();
-  for (const c of cells) {
-    if (c[1] === 0) qrUnder.set(c[0] + ',' + c[2], c[4]);
-  }
-
-  // Group by (scale, isBase) so base voxels and tree voxels can have different shadow settings.
-  const groups = new Map();
-  for (const c of cells) {
-    const [x, y, z, scale, color] = c;
-    const isBase = (y === 0);
-    const key = scale + '|' + (isBase ? 'b' : 't');
-    if (!groups.has(key)) groups.set(key, { scale, isBase, items: [] });
-    groups.get(key).items.push({
-      pos: [x, y, z],
-      treeCol: new THREE.Color(color),
-      qrCol: new THREE.Color(isBase ? color : (qrUnder.get(x + ',' + z) || color)),
-    });
-  }
-
-  const M = new THREE.Matrix4();
-  const Q = new THREE.Quaternion();
-  const P = new THREE.Vector3();
-  for (const { scale, isBase, items } of groups.values()) {
-    // White base color so instanceColor passes through unmodified.
-    const mat = new THREE.MeshStandardMaterial({
-      color: 0xffffff, roughness: 0.9, metalness: 0.0,
-    });
-    const mesh = new THREE.InstancedMesh(boxGeo, mat, items.length);
-    mesh.castShadow = !isBase;
-    mesh.receiveShadow = true;
-    const S = new THREE.Vector3(scale, scale, scale);
-    for (let i = 0; i < items.length; i++) {
-      P.set(items[i].pos[0], items[i].pos[1], items[i].pos[2]);
-      M.compose(P, Q, S);
-      mesh.setMatrixAt(i, M);
-      _tmpColor.copy(items[i].treeCol).lerp(items[i].qrCol, blendFactor);
-      mesh.setColorAt(i, _tmpColor);
-    }
-    mesh.instanceMatrix.needsUpdate = true;
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-    root.add(mesh);
-    meshInstances.push({ mesh, items });
-  }
+  viewer.setCells(cells);
 }
 
-function updateInstanceColors() {
-  for (const { mesh, items } of meshInstances) {
-    for (let i = 0; i < items.length; i++) {
-      _tmpColor.copy(items[i].treeCol).lerp(items[i].qrCol, blendFactor);
-      mesh.setColorAt(i, _tmpColor);
-    }
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  }
-}
-
-function switchMode(m) {
-  if (MODE === m) return;
-  MODE = m;
-  lerpTo = TARGETS[m];
-  targetBlend = (m === 'qr') ? 1.0 : 0.0;
-  isTransitioning = true;
-  transitionFrames = 0;
-  controls.enabled = false;
-  document.getElementById('mode-toggle').textContent = (m === 'tree') ? '3D' : 'QR';
-}
-
-document.getElementById('mode-toggle').onclick = () => switchMode(MODE === 'tree' ? 'qr' : 'tree');
+document.getElementById('mode-toggle').onclick = () => {
+  const next = (viewer.mode === 'tree') ? 'qr' : 'tree';
+  viewer.switchMode(next);
+  document.getElementById('mode-toggle').textContent = (next === 'tree') ? '3D' : 'QR';
+};
 
 const urlIn = document.getElementById('url-input');
 const urlTheme = document.getElementById('url-theme');
@@ -398,10 +238,10 @@ const urlBtn = document.getElementById('url-gen');
 const urlStatus = document.getElementById('url-status');
 const copyEmbedBtn = document.getElementById('copy-embed-btn');
 const snapBtn = document.getElementById('snap');
+
 // Theme list comes from the backend (treegen) so it never drifts from the model.
 fetch('/api/themes').then(r => r.json()).then(themes => {
   for (const th of themes) {
-    THEME_QR[th.name] = { dark: th.dark, light: th.light };
     const o = document.createElement('option');
     o.value = th.name; o.textContent = th.label;
     urlTheme.appendChild(o);
@@ -425,7 +265,7 @@ async function generateFromUrl() {
     });
     const d = await r.json();
     if (d.error) throw new Error(d.error);
-    setCells(d.cells, d.theme);
+    showCells(d.cells);
     copyEmbedBtn.disabled = false;
     const dt = ((performance.now() - t0)/1000).toFixed(1);
     urlStatus.textContent = `${d.theme} · v${d.version} · ${d.count} vox · ckpt ep${d.ckpt_ep} · ${dt}s · "${d.url}"`;
@@ -440,9 +280,8 @@ urlBtn.onclick = generateFromUrl;
 urlIn.addEventListener('keydown', e => { if (e.key === 'Enter') generateFromUrl(); });
 
 snapBtn.onclick = () => {
-  renderer.render(scene, camera);
   const a = document.createElement('a');
-  a.href = renderer.domElement.toDataURL('image/png');
+  a.href = viewer.snapshot();
   a.download = 'qrbloom_tree.png';
   a.click();
 };
@@ -465,94 +304,5 @@ copyEmbedBtn.onclick = () => {
     })
     .catch(e => alert('Copy failed: ' + e.message));
 };
-
-addEventListener('resize', () => {
-  renderer.setSize(innerWidth, innerHeight);
-  const aspect = innerWidth/innerHeight;
-  camera.left = -orthoHalf * aspect;
-  camera.right = orthoHalf * aspect;
-  camera.top = orthoHalf;
-  camera.bottom = -orthoHalf;
-  camera.updateProjectionMatrix();
-});
-
-function animate(){
-  requestAnimationFrame(animate);
-
-  // QR mode always lerps (no free rotation); tree mode only lerps during transition.
-  const shouldLerp = (MODE === "qr") || isTransitioning;
-
-  // Color blend always lerps independently of camera movement.
-  const K = 0.032;
-  const newBlend = blendFactor + (targetBlend - blendFactor) * K;
-  if (Math.abs(newBlend - blendFactor) > 0.001) {
-    blendFactor = newBlend;
-    updateInstanceColors();
-    // Fade directional light and boost ambient in QR mode to flatten shading.
-    dir.intensity = (1 - blendFactor) * DIR_BASE_INTENSITY;
-    amb.intensity = 0.6 + blendFactor * 1.0;
-  }
-
-  if (shouldLerp) {
-    _posT.fromArray(lerpTo.pos);
-    _tgtT.fromArray(lerpTo.tgt);
-    _upT.fromArray(lerpTo.up);
-    camera.position.lerp(_posT, K);
-    camera.up.lerp(_upT, K).normalize();
-    controls.target.lerp(_tgtT, K);
-    orthoHalf += (lerpTo.halfSize - orthoHalf) * K;
-    const aspect = innerWidth/innerHeight;
-    camera.left = -orthoHalf * aspect;
-    camera.right = orthoHalf * aspect;
-    camera.top = orthoHalf;
-    camera.bottom = -orthoHalf;
-    camera.updateProjectionMatrix();
-
-    if (isTransitioning) {
-      transitionFrames++;
-      const dist = camera.position.distanceTo(_posT);
-      if (dist < 0.3 || transitionFrames > 300) {
-        isTransitioning = false;
-        controls.enabled = true;
-        controls.enableRotate = (MODE === "tree");
-        controls.enablePan = (MODE === "tree");
-        // Snap to the exact target so the resting state is deterministic
-        // (identical every cycle — lets the demo capture loop seamlessly).
-        camera.position.fromArray(lerpTo.pos);
-        camera.up.fromArray(lerpTo.up).normalize();
-        controls.target.fromArray(lerpTo.tgt);
-        orthoHalf = lerpTo.halfSize;
-        camera.left = -orthoHalf * aspect;
-        camera.right = orthoHalf * aspect;
-        camera.top = orthoHalf;
-        camera.bottom = -orthoHalf;
-        camera.updateProjectionMatrix();
-      }
-    }
-  }
-
-  // Reduce rotateSpeed near the top pole to prevent azimuth twisting.
-  if (!isTransitioning && MODE === "tree") {
-    // Turntable effect disabled
-    // turntable += TURNTABLE_SPEED;
-    const v = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
-    const polar = Math.acos(Math.max(-1, Math.min(1, v.y)));   // 0 = top, π = bottom
-    controls.rotateSpeed = polar < 0.35 ? (0.15 + (polar / 0.35) * 0.85) : 1.0;
-    // Elevation-driven QR blend: tilting toward top-down (elevation 80deg->90deg,
-    // polar 0.175->0 rad) gradients block colors from tree colors to QR colors.
-    let _bt = (0.175 - polar) / 0.175;
-    _bt = Math.max(0, Math.min(1, _bt));
-    targetBlend = _bt * _bt * (3 - 2 * _bt);   // smoothstep
-  } else {
-    controls.rotateSpeed = 1.0;
-    // Unwind the turntable to 0 in QR mode so the QR plane stays axis-aligned.
-    if (MODE === "qr") turntable += (0 - turntable) * K;
-  }
-  root.rotation.y = turntable;
-  window.__transitioning = isTransitioning;
-  controls.update();
-  renderer.render(scene, camera);
-}
-animate();
 </script>
 </body></html>
