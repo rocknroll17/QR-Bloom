@@ -13,19 +13,14 @@
 // background downloads of every trained version; per-version inference waits
 // only for the version it actually needs.
 
-import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.0/dist/ort.min.mjs';
+import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.0/dist/ort.webgpu.min.mjs';
 import qrcode from 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/+esm';
 
 const HF_BASE = 'https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/onnx';
 const MANIFEST_URL = `${HF_BASE}/manifest.json`;
 
-// WASM-only execution path. We tried WebGPU first, but ORT's JSEP backend
-// raises "Failed to run JSEP kernel" on the UNet decoder's 3D ConvTranspose
-// nodes (a known WebGPU-EP limitation). WASM (SIMD + multi-threaded when
-// available) is slower but produces byte-identical output.
+// Allow ORT to fetch its wasm artifacts from the matching CDN bundle.
 ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.0/dist/';
-ort.env.wasm.numThreads = Math.min(navigator.hardwareConcurrency || 4, 8);
-ort.env.wasm.simd = true;
 
 const T_TOTAL    = 500;        // Diffusion.T
 const STEPS      = 100;        // Diffusion.sample default
@@ -85,12 +80,8 @@ async function downloadVersion(version, onProgress) {
       if (onProgress) onProgress({ version, downloadedBytes: offset, totalBytes: total });
     }
     st.phase = 'creating-session';
-    // WASM only — ORT's WebGPU EP currently supports 2-D conv only, the
-    // UNet decoder's 3-D ConvTranspose fails with "only support 2-dimensional
-    // conv". WASM (SIMD + threads when COOP/COEP allow it) is slower but
-    // produces byte-identical output.
     const session = await ort.InferenceSession.create(buf, {
-      executionProviders: ['wasm'],
+      executionProviders: ['webgpu', 'wasm'],
       graphOptimizationLevel: 'all',
     });
     st.phase = 'ready';
