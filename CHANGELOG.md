@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.8...v1.2.0) (2026-05-28)
+
+
+### Features
+
+* **pages:** run the trained diffusion model in the browser ([#43](https://github.com/rocknroll17/QR-Bloom/issues/43)) ([0d0292e](https://github.com/rocknroll17/QR-Bloom/commit/0d0292e800ec71fb03ea7db34c382670a983073c))
+
+
+### Bug Fixes
+
+* **pages:** WASM-only inference, drop WebGPU EP ([#45](https://github.com/rocknroll17/QR-Bloom/issues/45)) ([063df78](https://github.com/rocknroll17/QR-Bloom/commit/063df786c477d1c7e4df8b3df21c5f790d407985))
+
 ## [1.1.8](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.7...v1.1.8) (2026-05-27)
 
 
