@@ -40,6 +40,7 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
           CHECKPOINTS_DIR: ${{ secrets.DEPLOY_CHECKPOINTS_DIR }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
@@ -48,12 +49,52 @@ jobs:
           # On a release event, pin to that exact tag — pulling :latest races
           # release.yml and can resolve to the *previous* version that still
           # answers under :latest, leaving prod a release behind.
-          envs: RELEASE_TAG,INPUT_TAG,CHECKPOINTS_DIR
+          envs: RELEASE_TAG,INPUT_TAG,CHECKPOINTS_DIR,HF_TOKEN
           script: |
             set -e
             TAG="${INPUT_TAG:-${RELEASE_TAG:-latest}}"
             IMAGE="ghcr.io/rocknroll17/qr-bloom:${TAG}"
             CHECKPOINTS="${CHECKPOINTS_DIR}"
+            HF_REPO="rocknroll17/QR-Bloom"
+
+            echo "==> Syncing checkpoints from Hugging Face Hub (${HF_REPO})"
+            # Compare HF's x-linked-etag (sha256 of the underlying file) against
+            # the local file's sha256. Download only if different. Atomic
+            # replace via .tmp + mv so a running container never sees a
+            # partial file.
+            mkdir -p "${CHECKPOINTS}"
+            for V in 2 3 4 5; do
+              for SUFFIX in "" "_best"; do
+                F="qrbloom_v${V}${SUFFIX}.pt"
+                URL="https://huggingface.co/${HF_REPO}/resolve/main/${F}"
+                DEST="${CHECKPOINTS}/${F}"
+                remote_sha=$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" -I "${URL}" \
+                  | tr -d '\r' \
+                  | awk 'tolower($1)=="x-linked-etag:" {gsub(/"/,"",$2); print $2; exit}')
+                if [ -z "${remote_sha}" ]; then
+                  echo "  ${F}: WARN no x-linked-etag from HF, skipping"
+                  continue
+                fi
+                if [ -f "${DEST}" ]; then
+                  local_sha=$(sha256sum "${DEST}" | awk '{print $1}')
+                  if [ "${local_sha}" = "${remote_sha}" ]; then
+                    echo "  ${F}: up to date (${remote_sha:0:12})"
+                    continue
+                  fi
+                  echo "  ${F}: changed (local ${local_sha:0:12} -> remote ${remote_sha:0:12})"
+                else
+                  echo "  ${F}: new (${remote_sha:0:12})"
+                fi
+                curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" -o "${DEST}.tmp" "${URL}"
+                got_sha=$(sha256sum "${DEST}.tmp" | awk '{print $1}')
+                if [ "${got_sha}" != "${remote_sha}" ]; then
+                  echo "  ${F}: ERROR sha256 mismatch after download (${got_sha} != ${remote_sha})"
+                  rm -f "${DEST}.tmp"; exit 1
+                fi
+                mv "${DEST}.tmp" "${DEST}"
+                echo "  ${F}: synced"
+              done
+            done
 
             echo "==> Pulling ${IMAGE}"
             # release.yml fires on the same tag push and races us. If the
