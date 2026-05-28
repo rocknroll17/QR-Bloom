@@ -273,5 +273,3 @@ SCRATCH.md
 .vscode/
 *.swp
 *.swo
-
-onnx_export/

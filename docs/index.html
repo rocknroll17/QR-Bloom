@@ -12,12 +12,9 @@
     --ink-soft: #475569;
     --ink-faint: #94a3b8;
     --line: #e2e8f0;
-    --line-strong: #cbd5e1;
     --paper: #ffffff;
     --accent: #16a34a;
-    --accent-hover: #15803d;
     --blue: #2563eb;
-    --blue-hover: #1d4ed8;
     --radius: 14px;
     --radius-sm: 9px;
   }
@@ -31,57 +28,68 @@
   }
   canvas { display: block; }
 
-  /* Brand wordmark — top-left, never blocks interaction. */
-  #brand {
+  /* Header — wordmark + tagline + repo link. */
+  #header {
     position: fixed; top: 18px; left: 22px; z-index: 11;
+    display: flex; flex-direction: column; gap: 2px;
+    user-select: none;
+  }
+  #brand {
     font-size: 15px; font-weight: 600;
     letter-spacing: -0.015em;
     color: var(--ink);
     text-decoration: none;
-    user-select: none;
-    transition: opacity 0.15s;
   }
-  #brand:hover { opacity: 0.6; }
+  #tagline {
+    font-size: 12px; color: var(--ink-soft);
+    max-width: 360px;
+    line-height: 1.4;
+  }
+  #tagline strong { color: var(--ink); font-weight: 600; }
+  #links {
+    position: fixed; top: 18px; right: 22px; z-index: 11;
+    display: flex; gap: 8px; align-items: center;
+  }
+  #links a {
+    font-size: 12.5px; font-weight: 500;
+    text-decoration: none;
+    padding: 7px 12px;
+    border-radius: var(--radius-sm);
+    transition: opacity 0.15s, background 0.15s;
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(18px);
+    border: 1px solid var(--line);
+    color: var(--ink-soft);
+  }
+  #links a:hover { color: var(--ink); }
+  /* Live model link gets the accent — it's the thing we want visitors to try. */
+  #live-link {
+    background: var(--ink) !important;
+    color: #fff !important;
+    border-color: var(--ink) !important;
+  }
+  #live-link:hover { opacity: 0.86; }
 
-  /* Dock — single floating panel that holds every control. */
+  /* Dock — floating control panel at the bottom. */
   #dock {
     position: fixed; left: 50%; bottom: 20px;
     transform: translateX(-50%);
     z-index: 10;
-    width: min(740px, calc(100% - 28px));
+    width: min(640px, calc(100% - 28px));
     padding: 10px;
-    display: flex; flex-direction: column; gap: 8px;
+    display: flex; align-items: center; gap: 8px;
     background: rgba(255, 255, 255, 0.82);
     backdrop-filter: blur(18px) saturate(140%);
-    -webkit-backdrop-filter: blur(18px) saturate(140%);
     border: 1px solid var(--line);
     border-radius: var(--radius);
     box-shadow:
       0 18px 48px -12px rgba(15, 23, 42, 0.22),
       0 2px 6px rgba(15, 23, 42, 0.05);
   }
-  .row { display: flex; align-items: center; gap: 8px; min-width: 0; }
-
-  /* Input row */
-  #url-input {
+  #theme-select {
     flex: 1; min-width: 0;
     font: inherit; font-size: 13.5px;
-    padding: 10px 13px;
-    background: var(--paper);
-    color: var(--ink);
-    border: 1px solid var(--line);
-    border-radius: var(--radius-sm);
-    outline: none;
-    transition: border-color 0.15s, box-shadow 0.15s;
-  }
-  #url-input::placeholder { color: var(--ink-faint); }
-  #url-input:focus {
-    border-color: var(--blue);
-    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
-  }
-  #url-theme {
-    font: inherit; font-size: 13px;
-    padding: 10px 28px 10px 12px;
+    padding: 10px 28px 10px 13px;
     background: var(--paper)
       url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='none' stroke='%2394a3b8' stroke-width='1.6' stroke-linecap='round' d='M1 1l4 4 4-4'/></svg>")
       no-repeat right 10px center;
@@ -90,124 +98,75 @@
     border-radius: var(--radius-sm);
     cursor: pointer; outline: none;
     appearance: none; -webkit-appearance: none;
-    max-width: 150px;
   }
-  #url-theme:focus { border-color: var(--blue); }
-  #url-gen {
-    font: inherit; font-size: 13px; font-weight: 600;
-    padding: 10px 18px;
-    background: var(--accent);
-    color: #fff;
-    border: 1px solid var(--accent);
+  #theme-select:focus { border-color: var(--blue); }
+  .view-btn {
+    font: inherit; font-size: 13px; font-weight: 500;
+    padding: 10px 14px;
+    background: var(--paper);
+    color: var(--ink-soft);
+    border: 1px solid var(--line);
     border-radius: var(--radius-sm);
     cursor: pointer;
-    transition: background 0.15s, transform 0.05s;
-    white-space: nowrap;
+    transition: color 0.15s, border-color 0.15s;
   }
-  #url-gen:hover:not(:disabled) { background: var(--accent-hover); }
-  #url-gen:active:not(:disabled) { transform: translateY(1px); }
-  #url-gen:disabled { opacity: 0.55; cursor: wait; }
+  .view-btn:hover { color: var(--ink); border-color: var(--ink-faint); }
+  .view-btn.active {
+    color: #fff; background: var(--ink);
+    border-color: var(--ink);
+  }
 
-  /* Controls row — divider sits between the two rows. */
-  .row.controls {
-    padding: 8px 2px 2px;
-    border-top: 1px dashed var(--line);
-  }
-  #mode-toggle {
-    font: inherit; font-size: 12.5px; font-weight: 600;
-    padding: 7px 14px;
-    background: var(--ink);
-    color: #fff;
-    border: 1px solid var(--ink);
-    border-radius: 8px;
-    cursor: pointer;
-    transition: opacity 0.15s;
-    min-width: 58px;
-    letter-spacing: 0.02em;
-  }
-  #mode-toggle:hover { opacity: 0.86; }
-
-  .tool {
-    font: inherit; font-size: 12.5px; font-weight: 500;
-    padding: 7px 13px;
-    background: var(--paper);
-    color: var(--ink);
+  /* Info chip — bottom-left, shows current sample text/version. */
+  #info {
+    position: fixed; left: 22px; bottom: 22px; z-index: 9;
+    font-size: 12px; color: var(--ink-soft);
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(18px);
+    padding: 8px 12px;
     border: 1px solid var(--line);
-    border-radius: 8px;
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    border-radius: var(--radius-sm);
   }
-  .tool:hover:not(:disabled) {
-    background: #f1f5f9;
-    border-color: var(--line-strong);
-  }
-  .tool:disabled { opacity: 0.4; cursor: not-allowed; }
-  #copy-embed-btn.copied {
-    background: var(--accent);
-    color: #fff;
-    border-color: var(--accent);
+  #info code {
+    font-size: 12px;
+    background: var(--bg);
+    padding: 1px 6px;
+    border-radius: 4px;
+    color: var(--ink);
   }
 
-  #url-status {
-    font-family: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
-    font-size: 11px;
-    color: var(--ink-faint);
-    margin-left: auto;
-    min-width: 0;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    padding-left: 4px;
+  @media (max-width: 600px) {
+    #header { top: 14px; left: 16px; }
+    #links { top: 14px; right: 16px; gap: 6px; }
+    #links a { padding: 6px 10px; font-size: 12px; }
+    #tagline { display: none; }
+    #info { left: 16px; bottom: auto; top: 64px; }
   }
-
-  /* Mobile layout */
-  @media (max-width: 640px) {
-    #brand { top: 14px; left: 16px; font-size: 14px; }
-    #dock {
-      bottom: 12px;
-      width: calc(100% - 20px);
-      padding: 9px;
-      border-radius: 13px;
-    }
-    .row { flex-wrap: wrap; gap: 7px; }
-    #url-input { flex: 1 1 100%; font-size: 16px; padding: 11px 13px; }
-    #url-theme { flex: 1 1 auto; max-width: none; }
-    #url-gen { flex: 1 1 auto; }
-    .row.controls { gap: 6px; }
-    #url-status {
-      flex: 1 1 100%;
-      margin-left: 0;
-      text-align: right;
-      padding-top: 4px;
-    }
-  }
-
-  /* ?nohud — clean view used for captures/embeds. */
-  html.nohud #brand, html.nohud #dock { opacity: 0; pointer-events: none; }
 </style>
-<script>
-  // ?nohud — apply the clean view before the body parses, so no post-load
-  // DOM mutation is needed (which can disrupt the WebGL canvas).
-  if (new URLSearchParams(location.search).has('nohud'))
-    document.documentElement.classList.add('nohud');
-</script>
-</head><body>
-<a id="brand" href="/">QR-Bloom</a>
+</head>
+<body>
+
+<div id="header">
+  <span id="brand">QR-Bloom</span>
+  <span id="tagline">
+    Procedural preview — same renderer, samples generated without the diffusion model.
+    For real model output, <strong>try the live model</strong>.
+  </span>
+</div>
+<div id="links">
+  <a id="live-link" href="https://qr-bloom.rocknroll17.com/" target="_blank" rel="noopener">Live model →</a>
+  <a href="https://github.com/rocknroll17/QR-Bloom" target="_blank" rel="noopener">GitHub →</a>
+</div>
 
 <div id="dock">
-  <div class="row">
-    <input id="url-input" type="text"
-           placeholder="Paste a link or short text, then press Enter"
-           spellcheck="false" autocomplete="off"/>
-    <select id="url-theme" aria-label="Theme"></select>
-    <button id="url-gen">Generate</button>
-  </div>
-  <div class="row controls">
-    <button id="mode-toggle">3D</button>
-    <button id="snap" class="tool">Save PNG</button>
-    <button id="copy-embed-btn" class="tool" disabled>Copy embed</button>
-    <span id="url-status"></span>
-  </div>
+  <select id="theme-select" aria-label="Tree theme"></select>
+  <button class="view-btn active" id="view-tree" type="button">Tree</button>
+  <button class="view-btn" id="view-qr" type="button">QR</button>
+</div>
+
+<div id="info">
+  <span id="info-label">Loading…</span>
+  &nbsp;·&nbsp;
+  <code id="info-text">—</code>
 </div>
 
 <script type="importmap">
@@ -216,101 +175,60 @@
   "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
 }}
 </script>
+
 <script type="module">
 import { Viewer } from './qrbloom-viewer.js';
-import { ensureManifest, downloadAllVersions, generate, getDownloadState }
-  from './qrbloom-inference.js';
 
-// Single shared viewer — same rendering code as the home-hosted gallery.
 const viewer = new Viewer(document.body);
 
-let _embedCells = [];
+const select = document.getElementById('theme-select');
+const infoLabel = document.getElementById('info-label');
+const infoText = document.getElementById('info-text');
+const viewTree = document.getElementById('view-tree');
+const viewQr = document.getElementById('view-qr');
 
-function showCells(cells) {
-  _embedCells = cells || [];
-  viewer.setCells(cells);
+function setActive(mode) {
+  viewTree.classList.toggle('active', mode === 'tree');
+  viewQr.classList.toggle('active', mode === 'qr');
+}
+viewTree.addEventListener('click', () => { viewer.switchMode('tree'); setActive('tree'); });
+viewQr.addEventListener('click',   () => { viewer.switchMode('qr');   setActive('qr');   });
+
+async function loadJSON(path) {
+  const r = await fetch(path, { cache: 'no-cache' });
+  if (!r.ok) throw new Error(`fetch failed: ${r.status} ${path}`);
+  return r.json();
 }
 
-document.getElementById('mode-toggle').onclick = () => {
-  const next = (viewer.mode === 'tree') ? 'qr' : 'tree';
-  viewer.switchMode(next);
-  document.getElementById('mode-toggle').textContent = (next === 'tree') ? '3D' : 'QR';
-};
+async function showSample(file, label) {
+  const data = await loadJSON(file);
+  viewer.setCells(data.cells);
+  infoLabel.textContent = label;
+  infoText.textContent = data.text;
+}
 
-const urlIn = document.getElementById('url-input');
-const urlTheme = document.getElementById('url-theme');
-const urlBtn = document.getElementById('url-gen');
-const urlStatus = document.getElementById('url-status');
-const copyEmbedBtn = document.getElementById('copy-embed-btn');
-const snapBtn = document.getElementById('snap');
-
-// Themes come from the manifest hosted alongside the ONNX weights so the UI
-// can never drift from what the trained model knows about.
-ensureManifest().then(m => {
-  for (const th of m.themes) {
-    const o = document.createElement('option');
-    o.value = th.name; o.textContent = th.label;
-    urlTheme.appendChild(o);
-  }
-  // Kick off background downloads for every trained version after the page
-  // is interactive. The first version that finishes lets the user generate;
-  // requesting a not-yet-ready version waits at the bottom-right status line.
-  downloadAllVersions(progress => {
-    const { ready, total, current, downloadedBytes, totalBytes } = progress;
-    if (ready === total) {
-      urlStatus.textContent = `models ready · ${total} versions`;
-    } else if (current) {
-      const mb = (downloadedBytes / 1e6).toFixed(0);
-      const tot = (totalBytes / 1e6).toFixed(0);
-      urlStatus.textContent =
-        `downloading v${current} · ${mb} / ${tot} MB · ${ready}/${total} ready`;
-    }
-  }).catch(e => { urlStatus.textContent = 'download error: ' + e.message; });
-}).catch(e => { urlStatus.textContent = 'manifest error: ' + e.message; });
-
-async function generateFromUrl() {
-  const url = urlIn.value.trim();
-  if (!url) { urlStatus.textContent = 'Please enter a URL.'; return; }
-  const theme = urlTheme.value;
-  urlBtn.disabled = true;
-  const t0 = performance.now();
+(async () => {
   try {
-    const result = await generate({
-      url, theme,
-      onPhase: (phase, info) => {
-        if (phase === 'waiting-download') {
-          const mb = (info.downloadedBytes / 1e6).toFixed(0);
-          const tot = (info.totalBytes / 1e6).toFixed(0);
-          urlStatus.textContent =
-            `waiting for v${info.version} · ${mb} / ${tot} MB`;
-        } else if (phase === 'sampling') {
-          urlStatus.textContent = `sampling v${info.version} · ${info.step}/${info.total}`;
-        }
-      },
+    const manifest = await loadJSON('samples/manifest.json');
+    for (const t of manifest.themes) {
+      const opt = document.createElement('option');
+      opt.value = t.file;
+      opt.textContent = t.label;
+      opt.dataset.label = t.label;
+      select.appendChild(opt);
+    }
+    select.addEventListener('change', () => {
+      const opt = select.options[select.selectedIndex];
+      showSample(opt.value, opt.dataset.label);
     });
-    showCells(result.cells);
-    copyEmbedBtn.disabled = false;
-    const dt = ((performance.now() - t0) / 1000).toFixed(1);
-    urlStatus.textContent = `${result.theme} · v${result.version} · ${dt}s`;
+    if (manifest.themes.length > 0) {
+      await showSample(manifest.themes[0].file, manifest.themes[0].label);
+    }
   } catch (e) {
-    urlStatus.textContent = 'Error: ' + e.message;
-  } finally {
-    urlBtn.disabled = false;
+    infoLabel.textContent = 'Failed to load samples';
+    infoText.textContent = e.message;
+    console.error(e);
   }
-}
-
-urlBtn.onclick = generateFromUrl;
-urlIn.addEventListener('keydown', e => { if (e.key === 'Enter') generateFromUrl(); });
-
-snapBtn.onclick = () => {
-  const a = document.createElement('a');
-  a.href = viewer.snapshot();
-  a.download = 'qrbloom_tree.png';
-  a.click();
-};
-
-// "Copy embed" stays disabled on Pages — the home-hosted backend renders the
-// embed template, and reproducing it offline would just duplicate the viewer.
-copyEmbedBtn.style.display = 'none';
+})();
 </script>
 </body></html>
