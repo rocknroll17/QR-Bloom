@@ -43,7 +43,7 @@ def export_version(V):
                 "schedule": {"T": T, "acp": diff.acp.numpy().astype(np.float32).tolist()},
                 "params": records}
     with open(f"{OUT}/weights_v{V}.bin", "wb") as f: f.write(buf)
-    json.dump(manifest, open(f"{OUT}/manifest_v{V}.json", "w"))
+    with open(f"{OUT}/manifest_v{V}.json", "w") as f: json.dump(manifest, f)
     print(f"v{V}: {len(records)} params, {len(buf)/1e6:.1f}MB, grid=({gxy},{gxy},{gz})")
     return {"weights": f"weights_v{V}.bin", "params": f"manifest_v{V}.json",
             "grid_xy": gxy, "grid_z": gz, "bytes": len(buf)}
@@ -54,7 +54,7 @@ try:
     themes = hf["themes"]
 except Exception as e:
     print("HF themes fetch failed, falling back to palette:", e)
-    pal = json.load(open(f"{OUT}/palette.json"))
+    with open(f"{OUT}/palette.json") as f: pal = json.load(f)
     names = ['cherryblossom','pine','socotra','maple','baobab','willow','magnolia','saguaro_cactus','palm','acacia']
     themes = [{"name": n, "label": n.replace('_',' ').title(), **pal[n]} for n in names]
 
@@ -65,5 +65,5 @@ for V in (2, 3, 4, 5):
 
 top = {"format_version": 1, "model_type": "qrbloom-unet3d-tfjs",
        "trained_versions": [int(v) for v in versions], "versions": versions, "themes": themes}
-json.dump(top, open(f"{OUT}/manifest.json", "w"))
+with open(f"{OUT}/manifest.json", "w") as f: json.dump(top, f)
 print("manifest.json:", top["trained_versions"])
