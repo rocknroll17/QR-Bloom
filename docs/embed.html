@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>QR-Bloom embed</title>
+<style>
+  html,body { margin:0; height:100%; background:#f8fafc; overflow:hidden; }
+  canvas { display:block; }
+  #err { font-family:system-ui,sans-serif; color:#94a3b8; font-size:13px; padding:16px; }
+  /* Tree/QR toggle — bottom-right, the conventional spot for a viewer control */
+  #toggle {
+    position:fixed; right:12px; bottom:12px; z-index:10;
+    font-family:system-ui,-apple-system,sans-serif; font-size:13px; font-weight:600;
+    padding:7px 14px; border:1px solid #e2e8f0; border-radius:999px;
+    background:#fff; color:#0f172a; cursor:pointer; box-shadow:0 2px 8px rgba(15,23,42,.12);
+    -webkit-user-select:none; user-select:none;
+  }
+  #toggle:hover { background:#f1f5f9; }
+</style>
+</head>
+<body>
+<div id="err" style="display:none">Could not load embed.</div>
+<button id="toggle" style="display:none" title="Switch between the 3D tree and the scannable QR">QR</button>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+// Self-contained QR-Bloom viewer. The frozen tree's cell data rides in the URL
+// hash (gzip + base64url) — no model, no inference, no host-page dependency.
+// Reuses the shared Viewer so the embed has the same tree/QR modes (the QR view
+// blends each column to its base colour, so the top-down silhouette scans).
+import { Viewer } from './qrbloom-viewer.js';
+
+async function gunzipB64(b64) {
+  const bin = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+  const buf = Uint8Array.from(bin, c => c.charCodeAt(0));
+  const ds = new DecompressionStream('gzip');
+  const out = new Response(new Blob([buf]).stream().pipeThrough(ds));
+  return out.text();
+}
+async function loadCells() {
+  const raw = location.hash.slice(1);
+  if (!raw) throw new Error('no data in hash');
+  try { return JSON.parse(await gunzipB64(raw)); }
+  catch { return JSON.parse(decodeURIComponent(escape(atob(raw.replace(/-/g,'+').replace(/_/g,'/'))))); }
+}
+
+loadCells().then(cells => {
+  const viewer = new Viewer(document.body);
+  viewer.setCells(cells);
+
+  // Turntable until the user grabs it (or toggles); then it holds their angle.
+  viewer.controls.autoRotate = true;
+  viewer.controls.autoRotateSpeed = 1.2;
+  viewer.controls.enableZoom = false;       // don't hijack the host page's scroll
+  const stopSpin = () => { viewer.controls.autoRotate = false; };
+  viewer.controls.addEventListener('start', stopSpin);
+
+  // Tree ⇄ QR toggle — lets a viewer flip to the scannable top-down code.
+  const btn = document.getElementById('toggle');
+  btn.style.display = '';
+  btn.onclick = () => {
+    stopSpin();
+    const next = viewer.mode === 'tree' ? 'qr' : 'tree';
+    viewer.switchMode(next);
+    btn.textContent = next === 'tree' ? 'QR' : '3D';
+  };
+}).catch(e => {
+  console.error(e);
+  const el = document.getElementById('err');
+  el.style.display = 'block';
+  el.textContent = 'Could not load embed: ' + e.message;
+});
+</script>
+</body></html>
