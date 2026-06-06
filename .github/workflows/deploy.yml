@@ -1,22 +1,20 @@
 name: Deploy
 
-# Pushes a new image to the production server (qr-bloom.rocknroll17.com)
-# whenever a Release is published, or on-demand via workflow_dispatch.
+# RETIRED. The live demo moved to GitHub Pages (the model now runs in the
+# browser on WebGPU), so this home-server gallery deploy is no longer used.
+# The file is kept for reference but disabled: the `release` auto-trigger is
+# removed and the job is gated off with `if: false`, so it never runs.
 #
-# The server is expected to have:
+# (Historical) It deployed a new image to the production server on every
+# published Release. The server was expected to have:
 #   - Docker with the NVIDIA Container Toolkit (--gpus all works)
 #   - The deploy SSH key registered in ~/.ssh/authorized_keys
 #   - The checkpoints/ directory at DEPLOY_CHECKPOINTS_DIR
 
 on:
-  release:
-    types: [published]
+  # Manual-only, and the job is gated off below — kept just so the file
+  # remains valid and visible in the Actions tab without ever executing.
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Image tag to pull (e.g. v1.1.4, defaults to latest)'
-        required: false
-        default: 'latest'
 
 permissions:
   contents: read
@@ -29,6 +27,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: false
     runs-on: ubuntu-latest
     environment:
       name: production
