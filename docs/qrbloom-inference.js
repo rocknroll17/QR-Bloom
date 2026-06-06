@@ -3,40 +3,71 @@
 // Mirrors the home-hosted gallery.py pipeline:
 //   pick_version_for_text(text) → segno-compatible smallest standard QR clamped
 //   into the trained-version range from manifest.json. Encode the QR matrix,
-//   pad it to the grid, run 100-step v-prediction diffusion sampling against
-//   the per-version ONNX UNet (qrbloom_v{N}.fp32.onnx), and post-process the
-//   (occ, rgb) output into the same `[x, y, z, scale, color]` cell list the
-//   viewer expects.
+//   pad it to the grid, run v-prediction diffusion sampling against the
+//   per-version UNet, and post-process the (occ, rgb) output into the same
+//   `[x, y, z, scale, color]` cell list the viewer expects.
 //
-// ONNX weights live on Hugging Face. Manifest at the same path supplies
-// sha256, grid sizes, and theme metadata. First page load kicks off
-// background downloads of every trained version; per-version inference waits
-// only for the version it actually needs.
+// Weights live on Hugging Face. Manifest at the same path supplies grid sizes
+// and theme metadata. First page load kicks off background downloads of every
+// trained version; per-version inference waits only for the one it needs.
+//
+// ENGINE: tf.js on the WebGPU backend. (ORT's WebGPU EP supports 2-D conv
+// only — the UNet's 3-D ConvTranspose fails — and ORT-WASM is CPU-slow.) The
+// model (qrbloom-model.js) runs every 3-D conv as a stack of 2-D convs over
+// depth slices: numerically identical to the PyTorch model (max|diff| 3.8e-4)
+// but on tf.js's fast conv2d kernels (~8x faster than its conv3d). WebGPU
+// needs no COOP/COEP, so plain static hosting works.
 
-import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.0/dist/ort.min.mjs';
 import qrcode from 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/+esm';
+import { makeQRBloom } from './qrbloom-model.js';
 
-const HF_BASE = 'https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/onnx';
+const HF_BASE = 'https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/tfjs';
 const MANIFEST_URL = `${HF_BASE}/manifest.json`;
 
-// WASM-only execution path. We tried WebGPU first, but ORT's JSEP backend
-// raises "Failed to run JSEP kernel" on the UNet decoder's 3D ConvTranspose
-// nodes (a known WebGPU-EP limitation). WASM (SIMD + multi-threaded when
-// available) is slower but produces byte-identical output.
-ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.0/dist/';
-ort.env.wasm.numThreads = Math.min(navigator.hardwareConcurrency || 4, 8);
-ort.env.wasm.simd = true;
-
 const T_TOTAL    = 500;        // Diffusion.T
-const STEPS      = 100;        // Diffusion.sample default
+const STEPS      = 16;         // diffusion steps — tuned for browser (quality holds well below the gallery's 100)
 const X0_CH      = 4;
 const N_THEMES   = 10;
 const COSINE_S   = 0.008;
 
+// --- tf.js loader (runtime <script> injection — keeps index.html untouched) -
+
+let tf = null;
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.crossOrigin = 'anonymous';
+    s.onload = () => res(); s.onerror = () => rej(new Error('failed to load ' + src));
+    document.head.appendChild(s);
+  });
+}
+let _backendPromise = null;
+function ensureBackend() {
+  if (_backendPromise) return _backendPromise;
+  _backendPromise = (async () => {
+    if (!self.tf) {
+      await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js');
+      await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.22.0/dist/tf-backend-webgpu.min.js');
+      await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js');
+    }
+    tf = self.tf;
+    if (tf.wasm && tf.wasm.setWasmPaths)
+      tf.wasm.setWasmPaths('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/');
+    if (navigator.gpu) {
+      try { await tf.setBackend('webgpu'); await tf.ready();
+            if (tf.getBackend() !== 'webgpu') throw new Error('inactive'); }
+      catch (e) { console.warn('[qrbloom] WebGPU unavailable, WASM fallback:', e.message);
+                  await tf.setBackend('wasm'); await tf.ready(); }
+    } else { await tf.setBackend('wasm'); await tf.ready(); }
+    return tf.getBackend();
+  })();
+  return _backendPromise;
+}
+
 // --- manifest + downloads --------------------------------------------------
 
 let _manifest = null;
-const _versionState = new Map();  // version → { phase, bytes, total, sessionPromise, bytesNumber }
+const _versionState = new Map();  // version → { phase, bytes, total, fetchPromise, buf, params, net }
 
 export async function ensureManifest() {
   if (_manifest) return _manifest;
@@ -46,7 +77,7 @@ export async function ensureManifest() {
   for (const v of _manifest.trained_versions) {
     _versionState.set(v, {
       phase: 'pending', bytes: 0, total: _manifest.versions[String(v)].bytes,
-      sessionPromise: null, session: null,
+      fetchPromise: null, buf: null, params: null, net: null,
     });
   }
   return _manifest;
@@ -60,17 +91,19 @@ export function getDownloadState() {
   return out;
 }
 
-async function downloadVersion(version, onProgress) {
+// Phase 1: download bytes only (network — no GPU). Building the tf.js net and
+// the WebGPU warmup are deferred to first use (buildVersionNet) so streaming
+// every version on page load doesn't stutter the UI with GPU work.
+function fetchVersionBytes(version, onProgress) {
   const st = _versionState.get(version);
   if (!st) throw new Error(`unknown version ${version}`);
-  if (st.session) return st.session;
-  if (st.sessionPromise) return st.sessionPromise;
-
-  st.sessionPromise = (async () => {
+  if (st.buf || st.net) return Promise.resolve();
+  if (st.fetchPromise) return st.fetchPromise;
+  st.fetchPromise = (async () => {
     st.phase = 'downloading';
     const meta = _manifest.versions[String(version)];
-    const url = `${HF_BASE}/${meta.file}`;
-    const resp = await fetch(url, { cache: 'force-cache' });
+    st.params = await (await fetch(`${HF_BASE}/${meta.params}`, { cache: 'force-cache' })).json();
+    const resp = await fetch(`${HF_BASE}/${meta.weights}`, { cache: 'force-cache' });
     if (!resp.ok) throw new Error(`v${version} fetch ${resp.status}`);
     const reader = resp.body.getReader();
     const total = meta.bytes;
@@ -84,20 +117,36 @@ async function downloadVersion(version, onProgress) {
       st.bytes = offset;
       if (onProgress) onProgress({ version, downloadedBytes: offset, totalBytes: total });
     }
-    st.phase = 'creating-session';
-    // WASM only — ORT's WebGPU EP currently supports 2-D conv only, the
-    // UNet decoder's 3-D ConvTranspose fails with "only support 2-dimensional
-    // conv". WASM (SIMD + threads when COOP/COEP allow it) is slower but
-    // produces byte-identical output.
-    const session = await ort.InferenceSession.create(buf, {
-      executionProviders: ['wasm'],
-      graphOptimizationLevel: 'all',
+    st.buf = buf;
+    st.phase = 'downloaded';
+  })().catch(e => { st.phase = 'error'; throw e; });
+  return st.fetchPromise;
+}
+
+// Phase 2: build the tf.js net + warmup (GPU). Lazy — only when a version is
+// actually used for generation.
+let _buildChain = Promise.resolve();   // serialize builds so warmups don't pile on the GPU at once
+async function buildVersionNet(version) {
+  const st = _versionState.get(version);
+  if (st.net) return st.net;
+  await fetchVersionBytes(version);
+  st.netPromise = st.netPromise || (async () => {
+    await ensureBackend();
+    // serialize against any other in-flight build
+    const run = _buildChain.then(async () => {
+      st.phase = 'creating-session';
+      const net = makeQRBloom(tf, st.params, st.buf.buffer);
+      const [gx, , gz] = st.params.grid;
+      const o = net.forward(tf.zeros([1,gx,gx,gz,4]), tf.zeros([1,gx,gx,gz,1]), 0, 0, [0.5,0.5,0.5], 1.0);
+      await o.data(); o.dispose();
+      st.net = net; st.buf = null;   // free the raw bytes once on the GPU
+      st.phase = 'ready';
+      return net;
     });
-    st.phase = 'ready';
-    st.session = session;
-    return session;
-  })();
-  return st.sessionPromise;
+    _buildChain = run.catch(() => {});
+    return run;
+  })().catch(e => { st.phase = 'error'; throw e; });
+  return st.netPromise;
 }
 
 export async function downloadAllVersions(onProgress) {
@@ -105,7 +154,7 @@ export async function downloadAllVersions(onProgress) {
   const versions = m.trained_versions.slice();
   let ready = 0;
   const total = versions.length;
-  const downloads = versions.map(v => downloadVersion(v, p => {
+  const downloads = versions.map(v => fetchVersionBytes(v, p => {
     if (onProgress) onProgress({
       ready, total, current: v,
       downloadedBytes: p.downloadedBytes, totalBytes: p.totalBytes,
@@ -122,20 +171,15 @@ export async function downloadAllVersions(onProgress) {
 async function waitForVersion(version, onWait) {
   const st = _versionState.get(version);
   if (!st) throw new Error(`version ${version} not in manifest`);
-  if (st.session) return st.session;
-  if (!st.sessionPromise) {
-    // Page may not have kicked off background downloads yet — start now.
-    downloadVersion(version);
-  }
-  // Poll progress for the status line until the session resolves.
-  while (!st.session) {
-    if (onWait) {
-      onWait({ version, downloadedBytes: st.bytes, totalBytes: st.total });
-    }
-    await new Promise(r => setTimeout(r, 250));
+  if (st.net) return st.net;
+  // make sure bytes are downloading, surface progress, then build the net
+  fetchVersionBytes(version).catch(() => {});
+  while (!st.buf && !st.net) {
     if (st.phase === 'error') throw new Error(`v${version} download failed`);
+    if (onWait) onWait({ version, downloadedBytes: st.bytes, totalBytes: st.total });
+    await new Promise(r => setTimeout(r, 250));
   }
-  return st.session;
+  return buildVersionNet(version);
 }
 
 // --- QR encoding -----------------------------------------------------------
@@ -217,9 +261,24 @@ function fillNormal(arr) {
   }
 }
 
+// --- model forward: NCHW Float32Array -> v_pred NCHW Float32Array -----------
+// The diffusion loop below keeps the exact NCHW layout / math from the ONNX
+// path. The tf.js model is NDHWC, so transpose in and out around net.forward.
+
+async function forwardNCHW(net, xNCHW, D, H, W, t, condNDHWC, themeIdx) {
+  const vT = tf.tidy(() => {
+    const xND = tf.transpose(tf.tensor(xNCHW, [1, X0_CH, D, H, W]), [0, 2, 3, 4, 1]); // NDHWC
+    const v = net.forward(xND, condNDHWC, t, themeIdx, [0.5, 0.5, 0.5], 1.0);          // NDHWC
+    return tf.transpose(v, [0, 4, 1, 2, 3]);                                           // NCHW
+  });
+  const data = await vT.data();
+  vT.dispose();
+  return data;
+}
+
 // --- model_generate-equivalent sampling loop -------------------------------
 
-async function sampleVoxels(session, version, themeIdx, qr, onPhase) {
+async function sampleVoxels(net, version, themeIdx, qr, onPhase) {
   const meta = _manifest.versions[String(version)];
   const D = meta.grid_xy;
   const H = meta.grid_xy;
@@ -227,7 +286,7 @@ async function sampleVoxels(session, version, themeIdx, qr, onPhase) {
   const channels = X0_CH;
   const voxN = channels * D * H * W;
 
-  // Build cond tensor: 1 inside the QR footprint columns, 0 elsewhere.
+  // Build cond: 1 inside the QR footprint columns, 0 elsewhere.
   const condArr = new Float32Array(D * H * W);
   const m = qr.modules;
   const off = Math.floor((D - m) / 2);
@@ -239,10 +298,7 @@ async function sampleVoxels(session, version, themeIdx, qr, onPhase) {
       }
     }
   }
-  const condTensor = new ort.Tensor('float32', condArr, [1, 1, D, H, W]);
-  const themeTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(themeIdx)]), [1]);
-  const attrTensor  = new ort.Tensor('float32', Float32Array.from([0.5, 0.5, 0.5]), [1, 3]);
-  const m1Tensor    = new ort.Tensor('int64', BigInt64Array.from([1n]), [1]);
+  const condNDHWC = tf.tensor(condArr, [1, D, H, W, 1]);   // built once, reused every step
 
   let x = new Float32Array(voxN);
   fillNormal(x);
@@ -253,13 +309,7 @@ async function sampleVoxels(session, version, themeIdx, qr, onPhase) {
 
   for (let idx = 0; idx < steps; idx++) {
     const t = seq[idx];
-    const tTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(t)]), [1]);
-    const xTensor = new ort.Tensor('float32', x, [1, channels, D, H, W]);
-    const out = await session.run({
-      x: xTensor, t: tTensor, cond: condTensor,
-      theme: themeTensor, attr: attrTensor, attr_mask: m1Tensor,
-    });
-    const vPred = out.v_pred.data;   // Float32Array
+    const vPred = await forwardNCHW(net, x, D, H, W, t, condNDHWC, themeIdx);  // Float32Array NCHW
     const a = SCHED.sqrt_acp[t];
     const b = SCHED.sqrt_one_minus_acp[t];
     // x0_pred = a*x - b*v, clamp(-1,1); eps_pred = b*x + a*v
@@ -286,15 +336,13 @@ async function sampleVoxels(session, version, themeIdx, qr, onPhase) {
     } else {
       x = x0;
     }
-    if (onPhase && (idx % 5 === 0 || idx === steps - 1)) {
+    if (onPhase && (idx % 2 === 0 || idx === steps - 1)) {
       onPhase('sampling', { version, step: idx + 1, total: steps });
     }
-    // Yield to the browser so the UI stays alive.
-    if (idx % 4 === 0) await new Promise(r => setTimeout(r, 0));
   }
+  condNDHWC.dispose();
 
   // Enforce footprint: outside QR mask, set to -1 (will be rejected by occ > 0).
-  // Mask is 1 inside columns where condArr > 0.5, else 0.
   for (let i = 0; i < D; i++) {
     for (let j = 0; j < H; j++) {
       const baseDH = i * H + j;
@@ -332,7 +380,6 @@ function buildCells(x0, D, H, W, qr, themeMeta) {
     }
   }
   // Tree voxels at y>=1 where occ channel > 0.
-  const sliceDH = H * W;
   const channelSize = D * H * W;
   const occBase = 3 * channelSize;
   const rBase = 0;
@@ -371,10 +418,10 @@ export async function generate({ url, theme, onPhase }) {
   const themeIdx = m.themes.findIndex(t => t.name === themeMeta.name);
   if (themeIdx < 0) throw new Error(`unknown theme ${theme}`);
   const qr = encodeQR(url, m.trained_versions);
-  const session = await waitForVersion(qr.version, info => {
+  const net = await waitForVersion(qr.version, info => {
     if (onPhase) onPhase('waiting-download', info);
   });
-  const { x0, D, H, W } = await sampleVoxels(session, qr.version, themeIdx, qr, onPhase);
+  const { x0, D, H, W } = await sampleVoxels(net, qr.version, themeIdx, qr, onPhase);
   const cells = buildCells(x0, D, H, W, qr, themeMeta);
   return { cells, version: qr.version, theme: themeMeta.name, url };
 }

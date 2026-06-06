@@ -142,6 +142,9 @@
     border-color: var(--line-strong);
   }
   .tool:disabled { opacity: 0.4; cursor: not-allowed; }
+  /* Before the first generation: keep the row's space (no layout jump) but
+     hide only the buttons — the status text stays visible. */
+  #controls-row.pending button { visibility: hidden; }
   #copy-embed-btn.copied {
     background: var(--accent);
     color: #fff;
@@ -158,6 +161,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
     padding-left: 4px;
+  }
+  #url-status .pbar {
+    display: inline-block; width: 92px; height: 6px; border-radius: 3px;
+    background: var(--line); vertical-align: middle; overflow: hidden; margin: 0 7px;
+  }
+  #url-status .pbar > i {
+    display: block; height: 100%; width: 0; background: var(--accent);
+    transition: width .15s ease;
   }
 
   /* Mobile layout */
@@ -202,10 +213,10 @@
     <select id="url-theme" aria-label="Theme"></select>
     <button id="url-gen">Generate</button>
   </div>
-  <div class="row controls">
+  <div class="row controls pending" id="controls-row">
     <button id="mode-toggle">3D</button>
     <button id="snap" class="tool">Save PNG</button>
-    <button id="copy-embed-btn" class="tool" disabled>Copy embed</button>
+    <button id="copy-embed-btn" class="tool">Copy embed</button>
     <span id="url-status"></span>
   </div>
 </div>
@@ -229,6 +240,9 @@ let _embedCells = [];
 function showCells(cells) {
   _embedCells = cells || [];
   viewer.setCells(cells);
+  // reveal the view / export buttons once there's something to act on
+  // (drops .pending — the row kept its space, so nothing jumps; status stays)
+  document.getElementById('controls-row').classList.remove('pending');
 }
 
 document.getElementById('mode-toggle').onclick = () => {
@@ -244,8 +258,17 @@ const urlStatus = document.getElementById('url-status');
 const copyEmbedBtn = document.getElementById('copy-embed-btn');
 const snapBtn = document.getElementById('snap');
 
-// Themes come from the manifest hosted alongside the ONNX weights so the UI
-// can never drift from what the trained model knows about.
+// Bottom-right status: plain text, or a label + thin progress bar + % when a
+// percentage is given.
+function setStatus(label, pct) {
+  if (pct == null) { urlStatus.textContent = label; return; }
+  const p = Math.max(0, Math.min(100, Math.round(pct)));
+  urlStatus.innerHTML =
+    label + ' <span class="pbar"><i style="width:' + p + '%"></i></span> ' + p + '%';
+}
+
+// Themes come from the manifest hosted alongside the weights so the UI can
+// never drift from what the trained model knows about.
 ensureManifest().then(m => {
   for (const th of m.themes) {
     const o = document.createElement('option');
@@ -253,20 +276,16 @@ ensureManifest().then(m => {
     urlTheme.appendChild(o);
   }
   // Kick off background downloads for every trained version after the page
-  // is interactive. The first version that finishes lets the user generate;
-  // requesting a not-yet-ready version waits at the bottom-right status line.
-  downloadAllVersions(progress => {
-    const { ready, total, current, downloadedBytes, totalBytes } = progress;
-    if (ready === total) {
-      urlStatus.textContent = `models ready · ${total} versions`;
-    } else if (current) {
-      const mb = (downloadedBytes / 1e6).toFixed(0);
-      const tot = (totalBytes / 1e6).toFixed(0);
-      urlStatus.textContent =
-        `downloading v${current} · ${mb} / ${tot} MB · ${ready}/${total} ready`;
-    }
-  }).catch(e => { urlStatus.textContent = 'download error: ' + e.message; });
-}).catch(e => { urlStatus.textContent = 'manifest error: ' + e.message; });
+  // is interactive. Bottom-right shows one combined progress bar, then "Ready".
+  downloadAllVersions(() => {
+    let dl = 0, tot = 0;
+    const st = getDownloadState();
+    for (const v in st) { dl += st[v].bytes; tot += st[v].total; }
+    setStatus('Downloading models', tot ? (dl / tot) * 100 : 0);
+  })
+    .then(() => setStatus('Ready'))
+    .catch(e => setStatus('Download error: ' + e.message));
+}).catch(e => setStatus('Manifest error: ' + e.message));
 
 async function generateFromUrl() {
   const url = urlIn.value.trim();
@@ -279,21 +298,17 @@ async function generateFromUrl() {
       url, theme,
       onPhase: (phase, info) => {
         if (phase === 'waiting-download') {
-          const mb = (info.downloadedBytes / 1e6).toFixed(0);
-          const tot = (info.totalBytes / 1e6).toFixed(0);
-          urlStatus.textContent =
-            `waiting for v${info.version} · ${mb} / ${tot} MB`;
+          setStatus('Loading model', info.totalBytes ? (info.downloadedBytes / info.totalBytes) * 100 : 0);
         } else if (phase === 'sampling') {
-          urlStatus.textContent = `sampling v${info.version} · ${info.step}/${info.total}`;
+          setStatus('Generating', (info.step / info.total) * 100);
         }
       },
     });
     showCells(result.cells);
     copyEmbedBtn.disabled = false;
-    const dt = ((performance.now() - t0) / 1000).toFixed(1);
-    urlStatus.textContent = `${result.theme} · v${result.version} · ${dt}s`;
+    setStatus('Ready');
   } catch (e) {
-    urlStatus.textContent = 'Error: ' + e.message;
+    setStatus('Error: ' + e.message);
   } finally {
     urlBtn.disabled = false;
   }
@@ -309,8 +324,31 @@ snapBtn.onclick = () => {
   a.click();
 };
 
-// "Copy embed" stays disabled on Pages — the home-hosted backend renders the
-// embed template, and reproducing it offline would just duplicate the viewer.
-copyEmbedBtn.style.display = 'none';
+// Copy embed: freeze the CURRENT tree into a one-line <iframe>. The cell data
+// is gzip+base64url-packed into the iframe URL hash, so embed.html renders it
+// exactly as shown — no model, no inference, no host-page dependency. The user
+// pastes the iframe into any site; it's fully isolated inside its own document.
+copyEmbedBtn.onclick = async () => {
+  if (!_embedCells.length) return;
+  try {
+    const json = JSON.stringify(_embedCells);
+    const cs = new CompressionStream('gzip');
+    const bytes = new Uint8Array(await new Response(
+      new Blob([new TextEncoder().encode(json)]).stream().pipeThrough(cs)).arrayBuffer());
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    const enc = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const src = new URL('embed.html', location.href).href + '#' + enc;
+    const code = `<iframe src="${src}" width="420" height="420" frameborder="0" `
+               + `style="border:0;border-radius:10px;overflow:hidden"></iframe>`;
+    await navigator.clipboard.writeText(code);
+    copyEmbedBtn.textContent = 'Copied!';
+    copyEmbedBtn.classList.add('copied');
+    setTimeout(() => {
+      copyEmbedBtn.textContent = 'Copy embed';
+      copyEmbedBtn.classList.remove('copied');
+    }, 2200);
+  } catch (e) { alert('Copy failed: ' + e.message); }
+};
 </script>
 </body></html>
