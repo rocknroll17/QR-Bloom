@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.0](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.9...v1.2.0) (2026-06-06)
+
+
+### Features
+
+* **pages:** run the real model in-browser on WebGPU (tf.js) ([#52](https://github.com/rocknroll17/QR-Bloom/issues/52)) ([647d71b](https://github.com/rocknroll17/QR-Bloom/commit/647d71b1ac3849fa70c83b7613f9b14b29815eeb))
+
+
+### Bug Fixes
+
+* **scripts:** close files explicitly in export_for_tfjs (CodeQL) ([#54](https://github.com/rocknroll17/QR-Bloom/issues/54)) ([26a4466](https://github.com/rocknroll17/QR-Bloom/commit/26a4466d7580bb90292942fc33fc60105122b83d))
+* **templates:** strip stray tags at end of embed.html ([#57](https://github.com/rocknroll17/QR-Bloom/issues/57)) ([d8d47aa](https://github.com/rocknroll17/QR-Bloom/commit/d8d47aa4232a96133b7c099302fd91b087120d5d))
+
+
+### Documentation
+
+* **readme:** point Try it at the in-browser WebGPU demo ([#55](https://github.com/rocknroll17/QR-Bloom/issues/55)) ([6879559](https://github.com/rocknroll17/QR-Bloom/commit/68795597fa6e01be6d31c10683e5412c3d15a157))
+
 ## [1.1.9](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.8...v1.1.9) (2026-05-28)
 
 
