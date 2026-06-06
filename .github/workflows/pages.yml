@@ -1,17 +1,14 @@
 name: Deploy GitHub Pages demo
 
-# Builds and publishes the static demo at docs/ to GitHub Pages on every push
-# to main. The build step regenerates the procedural voxel samples so the
-# deployed page always matches the latest treegen.py.
+# Publishes the static demo at docs/ to GitHub Pages on every push to main.
+# The page runs the diffusion model in the browser (WebGPU) and loads the
+# weights from Hugging Face, so there is nothing to build.
 
 on:
   push:
     branches: [main]
     paths:
       - 'docs/**'
-      - 'scripts/build_pages_demo.py'
-      - 'qrbloom/treegen.py'
-      - 'qrbloom/qr.py'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -30,18 +27,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-          cache: pip
-
-      - name: Install demo dependencies
-        run: pip install numpy segno
-
-      - name: Regenerate voxel samples
-        run: python scripts/build_pages_demo.py
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
