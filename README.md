@@ -12,13 +12,11 @@ viewed from above it is a working QR code.
 
 ### Try it
 
-- **[Try the trained model →](https://qr-bloom.rocknroll17.com/)**
-  Type a URL or short text, pick a theme, and the diffusion model renders
-  a fresh voxel tree on the fly. Tilt to top-down to scan the QR.
-- **[Procedural preview →](https://rocknroll17.github.io/QR-Bloom/)**
-  Static GitHub Pages demo — same renderer, but the trees are produced by
-  the procedural generator that the diffusion model is trained to reproduce.
-  No backend required.
+- **[Live demo →](https://qr-bloom.rocknroll17.com/)**
+  Type a URL or short text, pick a theme, and the diffusion model runs right
+  in your browser (WebGPU) to grow a fresh voxel tree. Flip to the top-down
+  view to scan the QR, or copy a one-line embed of the result. No backend —
+  it's a static GitHub Pages site that loads the model weights on the fly.
 
 ![demo](assets/demo.gif)
 
