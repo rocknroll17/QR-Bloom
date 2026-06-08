@@ -100,7 +100,7 @@ const _RETRYABLE = new Set([403, 408, 429, 500, 502, 503, 504]);
 
 async function _withRetry(fn, label, tries = 4) {
   for (let i = 0; ; i++) {
-    try { return await fn(); }
+    try { return await fn(i); }   // pass the attempt index so retries can bypass the cache
     catch (e) {
       if (e.fatal || i >= tries - 1) throw e;
       console.warn(`[qrbloom] ${label} retry ${i + 1}/${tries - 1}: ${e.message}`);
@@ -125,12 +125,17 @@ function fetchVersionBytes(version, onProgress) {
   st.fetchPromise = (async () => {
     st.phase = 'downloading';
     const meta = _manifest.versions[String(version)];
+    // First try the HTTP cache (force-cache avoids re-downloading the 45 MB on
+    // every load), but on retry use 'reload' to BYPASS the cache — otherwise a
+    // transient 403 that got cached (HF Xet hiccup) would be replayed forever.
+    // 'reload' fetches fresh AND overwrites the stale cache entry, self-healing.
+    const cacheMode = (i) => (i === 0 ? 'force-cache' : 'reload');
     st.params = await _withRetry(
-      () => _fetchOk(`${HF_BASE}/${meta.params}`, { cache: 'force-cache' }).then((r) => r.json()),
+      (i) => _fetchOk(`${HF_BASE}/${meta.params}`, { cache: cacheMode(i) }).then((r) => r.json()),
       `v${version} params`);
     // the whole stream lives inside the retry, so a mid-download failure restarts it
-    st.buf = await _withRetry(async () => {
-      const resp = await _fetchOk(`${HF_BASE}/${meta.weights}`, { cache: 'force-cache' });
+    st.buf = await _withRetry(async (i) => {
+      const resp = await _fetchOk(`${HF_BASE}/${meta.weights}`, { cache: cacheMode(i) });
       const reader = resp.body.getReader();
       const total = meta.bytes;
       const buf = new Uint8Array(total);
