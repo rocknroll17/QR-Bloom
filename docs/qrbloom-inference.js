@@ -91,6 +91,29 @@ export function getDownloadState() {
   return out;
 }
 
+// HF's Xet CDN intermittently returns a transient 403 on browser fetches, so
+// every download is wrapped in exponential-backoff retries. (403 is normally
+// not retryable, but HF Xet's is a known transient signed-URL / outage quirk;
+// genuinely permanent statuses like 404 are marked fatal and not retried.)
+const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const _RETRYABLE = new Set([403, 408, 429, 500, 502, 503, 504]);
+
+async function _withRetry(fn, label, tries = 4) {
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (e) {
+      if (e.fatal || i >= tries - 1) throw e;
+      console.warn(`[qrbloom] ${label} retry ${i + 1}/${tries - 1}: ${e.message}`);
+      await _sleep(Math.min(8000, 500 * 2 ** i) + Math.random() * 300); // backoff + jitter
+    }
+  }
+}
+async function _fetchOk(url, opts) {
+  const r = await fetch(url, opts);            // network errors throw -> retried
+  if (!r.ok) { const e = new Error(`${r.status}`); e.fatal = !_RETRYABLE.has(r.status); throw e; }
+  return r;
+}
+
 // Phase 1: download bytes only (network — no GPU). Building the tf.js net and
 // the WebGPU warmup are deferred to first use (buildVersionNet) so streaming
 // every version on page load doesn't stutter the UI with GPU work.
@@ -102,24 +125,32 @@ function fetchVersionBytes(version, onProgress) {
   st.fetchPromise = (async () => {
     st.phase = 'downloading';
     const meta = _manifest.versions[String(version)];
-    st.params = await (await fetch(`${HF_BASE}/${meta.params}`, { cache: 'force-cache' })).json();
-    const resp = await fetch(`${HF_BASE}/${meta.weights}`, { cache: 'force-cache' });
-    if (!resp.ok) throw new Error(`v${version} fetch ${resp.status}`);
-    const reader = resp.body.getReader();
-    const total = meta.bytes;
-    const buf = new Uint8Array(total);
-    let offset = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf.set(value, offset);
-      offset += value.byteLength;
-      st.bytes = offset;
-      if (onProgress) onProgress({ version, downloadedBytes: offset, totalBytes: total });
-    }
-    st.buf = buf;
+    st.params = await _withRetry(
+      () => _fetchOk(`${HF_BASE}/${meta.params}`, { cache: 'force-cache' }).then((r) => r.json()),
+      `v${version} params`);
+    // the whole stream lives inside the retry, so a mid-download failure restarts it
+    st.buf = await _withRetry(async () => {
+      const resp = await _fetchOk(`${HF_BASE}/${meta.weights}`, { cache: 'force-cache' });
+      const reader = resp.body.getReader();
+      const total = meta.bytes;
+      const buf = new Uint8Array(total);
+      let offset = 0; st.bytes = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf.set(value, offset);
+        offset += value.byteLength;
+        st.bytes = offset;
+        if (onProgress) onProgress({ version, downloadedBytes: offset, totalBytes: total });
+      }
+      return buf;
+    }, `v${version} weights`);
     st.phase = 'downloaded';
-  })().catch(e => { st.phase = 'error'; throw e; });
+  })().catch((e) => {
+    st.phase = 'error';
+    st.fetchPromise = null;   // clear so a later call (e.g. Generate) can retry from scratch
+    throw e;
+  });
   return st.fetchPromise;
 }
 
