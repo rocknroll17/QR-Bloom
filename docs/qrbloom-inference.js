@@ -69,9 +69,38 @@ function ensureBackend() {
 let _manifest = null;
 const _versionState = new Map();  // version → { phase, bytes, total, fetchPromise, buf, params, net }
 
+// Weights are persisted in the Cache API keyed by their content hash (sha256
+// from the manifest), so they download exactly once and survive reloads —
+// unlike the HTTP cache, which can't hold them (HF mints a new signed URL per
+// request, so the URL cache key never matches). A model update changes the
+// hash, so the key changes and the new weights are fetched; stale entries from
+// old revisions are pruned below.
+const _CACHE_NAME = 'qrbloom-weights-v1';
+async function _openCache() { try { return await caches.open(_CACHE_NAME); } catch { return null; } }
+const _verSha = (meta) => meta.sha256 || String(meta.bytes); // fallback if manifest lacks a hash
+const _wKey = (v, sha) => `qrbloom-cache/weights-v${v}-${sha}`;
+const _pKey = (v, sha) => `qrbloom-cache/params-v${v}-${sha}`;
+
+async function _pruneCache() {
+  const cache = await _openCache();
+  if (!cache) return;
+  const valid = new Set();
+  for (const v of _manifest.trained_versions) {
+    const sha = _verSha(_manifest.versions[String(v)]);
+    valid.add(_wKey(v, sha)); valid.add(_pKey(v, sha));
+  }
+  try {
+    for (const req of await cache.keys()) {
+      const tail = new URL(req.url).pathname.replace(/^\//, '');
+      if (!valid.has(tail)) await cache.delete(req);   // drop entries from old model revisions
+    }
+  } catch { /* cache eviction races are non-fatal */ }
+}
+
 export async function ensureManifest() {
   if (_manifest) return _manifest;
-  const r = await fetch(MANIFEST_URL, { cache: 'force-cache' });
+  // Fetch fresh (revalidate) so a re-uploaded model is picked up immediately.
+  const r = await fetch(MANIFEST_URL, { cache: 'no-cache' });
   if (!r.ok) throw new Error(`manifest fetch ${r.status}`);
   _manifest = await r.json();
   for (const v of _manifest.trained_versions) {
@@ -80,6 +109,7 @@ export async function ensureManifest() {
       fetchPromise: null, buf: null, params: null, net: null,
     });
   }
+  await _pruneCache();
   return _manifest;
 }
 
@@ -125,31 +155,47 @@ function fetchVersionBytes(version, onProgress) {
   st.fetchPromise = (async () => {
     st.phase = 'downloading';
     const meta = _manifest.versions[String(version)];
-    // First try the HTTP cache (force-cache avoids re-downloading the 45 MB on
-    // every load), but on retry use 'reload' to BYPASS the cache — otherwise a
-    // transient 403 that got cached (HF Xet hiccup) would be replayed forever.
-    // 'reload' fetches fresh AND overwrites the stale cache entry, self-healing.
-    const cacheMode = (i) => (i === 0 ? 'force-cache' : 'reload');
-    st.params = await _withRetry(
-      (i) => _fetchOk(`${HF_BASE}/${meta.params}`, { cache: cacheMode(i) }).then((r) => r.json()),
-      `v${version} params`);
-    // the whole stream lives inside the retry, so a mid-download failure restarts it
-    st.buf = await _withRetry(async (i) => {
-      const resp = await _fetchOk(`${HF_BASE}/${meta.weights}`, { cache: cacheMode(i) });
-      const reader = resp.body.getReader();
-      const total = meta.bytes;
-      const buf = new Uint8Array(total);
-      let offset = 0; st.bytes = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf.set(value, offset);
-        offset += value.byteLength;
-        st.bytes = offset;
-        if (onProgress) onProgress({ version, downloadedBytes: offset, totalBytes: total });
-      }
-      return buf;
-    }, `v${version} weights`);
+    const sha = _verSha(meta);
+    const cache = await _openCache();
+    // Network downloads use cache:'no-store' (never touch the HTTP cache, which
+    // would otherwise pin a transient 403); retries re-fetch fresh. Persistence
+    // is handled by the Cache API below, keyed by content hash.
+    const params = await (cache && cache.match(_pKey(version, sha)).catch(() => null));
+    if (params) st.params = await params.json();
+    else {
+      st.params = await _withRetry(
+        () => _fetchOk(`${HF_BASE}/${meta.params}`, { cache: 'no-store' }).then((r) => r.json()),
+        `v${version} params`);
+      if (cache) cache.put(_pKey(version, sha),
+        new Response(JSON.stringify(st.params), { headers: { 'content-type': 'application/json' } })).catch(() => {});
+    }
+
+    const hit = await (cache && cache.match(_wKey(version, sha)).catch(() => null));
+    if (hit) {                                   // cache hit — no network, no re-download
+      st.bytes = meta.bytes;
+      if (onProgress) onProgress({ version, downloadedBytes: meta.bytes, totalBytes: meta.bytes });
+      st.buf = new Uint8Array(await hit.arrayBuffer());
+    } else {
+      // the whole stream lives inside the retry, so a mid-download failure restarts it
+      st.buf = await _withRetry(async () => {
+        const resp = await _fetchOk(`${HF_BASE}/${meta.weights}`, { cache: 'no-store' });
+        const reader = resp.body.getReader();
+        const total = meta.bytes;
+        const buf = new Uint8Array(total);
+        let offset = 0; st.bytes = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf.set(value, offset);
+          offset += value.byteLength;
+          st.bytes = offset;
+          if (onProgress) onProgress({ version, downloadedBytes: offset, totalBytes: total });
+        }
+        return buf;
+      }, `v${version} weights`);
+      if (cache) cache.put(_wKey(version, sha),
+        new Response(st.buf, { headers: { 'content-type': 'application/octet-stream' } })).catch(() => {});
+    }
     st.phase = 'downloaded';
   })().catch((e) => {
     st.phase = 'error';

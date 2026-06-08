@@ -7,7 +7,7 @@ Outputs into docs/assets/:
   manifest_v{N}.json   [{name, shape, offset, count}] + schedule + grid (per net)
   manifest.json        {trained_versions, versions{N:{weights,params,grid_xy,grid_z,bytes}}, themes}
 """
-import sys, os, json, urllib.request
+import sys, os, json, hashlib, urllib.request
 sys.path.insert(0, ".")
 import numpy as np, torch
 from qrbloom.diffusion import UNet3D, Diffusion, X0_CH, N_THEMES
@@ -46,7 +46,8 @@ def export_version(V):
     with open(f"{OUT}/manifest_v{V}.json", "w") as f: json.dump(manifest, f)
     print(f"v{V}: {len(records)} params, {len(buf)/1e6:.1f}MB, grid=({gxy},{gxy},{gz})")
     return {"weights": f"weights_v{V}.bin", "params": f"manifest_v{V}.json",
-            "grid_xy": gxy, "grid_z": gz, "bytes": len(buf)}
+            "grid_xy": gxy, "grid_z": gz, "bytes": len(buf),
+            "sha256": hashlib.sha256(bytes(buf)).hexdigest()}   # cache key — changes when the model does
 
 # themes from the HF manifest so the UI shows the exact same metadata
 try:
