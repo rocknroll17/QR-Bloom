@@ -267,6 +267,11 @@ function setStatus(label, pct) {
     label + ' <span class="pbar"><i style="width:' + p + '%"></i></span> ' + p + '%';
 }
 
+// Generate stays disabled until at least one model is actually downloaded — a
+// transient CDN failure must never leave a clickable button over a fake "Ready".
+urlBtn.disabled = true;
+setStatus('Loading models');
+
 // Themes come from the manifest hosted alongside the weights so the UI can
 // never drift from what the trained model knows about.
 ensureManifest().then(m => {
@@ -276,16 +281,25 @@ ensureManifest().then(m => {
     urlTheme.appendChild(o);
   }
   // Kick off background downloads for every trained version after the page
-  // is interactive. Bottom-right shows one combined progress bar, then "Ready".
+  // is interactive. Bottom-right shows one combined progress bar.
   downloadAllVersions(() => {
     let dl = 0, tot = 0;
     const st = getDownloadState();
     for (const v in st) { dl += st[v].bytes; tot += st[v].total; }
     setStatus('Downloading models', tot ? (dl / tot) * 100 : 0);
-  })
-    .then(() => setStatus('Ready'))
-    .catch(e => setStatus('Download error: ' + e.message));
-}).catch(e => setStatus('Manifest error: ' + e.message));
+  }).then(() => {
+    // Gate on actual readiness — only enable Generate if a model really loaded.
+    const all = Object.values(getDownloadState());
+    const ready = all.filter(s => s.phase === 'downloaded' || s.phase === 'ready').length;
+    if (ready > 0) {
+      urlBtn.disabled = false;
+      setStatus(ready === all.length ? 'Ready' : `Ready · ${ready}/${all.length} models`);
+    } else {
+      urlBtn.disabled = true;
+      setStatus('Model load failed — reload to retry');
+    }
+  });
+}).catch(e => { urlBtn.disabled = true; setStatus('Manifest error: ' + e.message); });
 
 async function generateFromUrl() {
   const url = urlIn.value.trim();
