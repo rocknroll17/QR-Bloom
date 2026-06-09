@@ -1,5 +1,20 @@
 """treegen.py — QR-conditioned voxel tree generator (10 species).
 
+Attribution
+-----------
+The voxel tree-generation algorithm in this file is adapted — ported to
+Python/NumPy — from **Grow-Voxly** by **Shovith Debnath**:
+
+    https://github.com/Hawkay002/.Grow
+    https://grow-voxly.space
+
+Grow-Voxly is published without an explicit license (default all-rights-
+reserved). This port is included with credit and in good faith; the original
+author's permission has been requested. It is provided for non-commercial,
+educational use and is NOT covered by this repository's MIT license (see
+NOTICE). The diffusion model trained on this generator's output is original
+work.
+
 Design
 ------
 * Trees grow only above the QR's dark modules (scannable from above); the

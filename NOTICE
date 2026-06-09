@@ -1,0 +1,24 @@
+QR-Bloom — NOTICE / third-party attribution
+===========================================
+
+Tree-generation algorithm
+-------------------------
+The voxel tree-generation logic in `qrbloom/treegen.py` is adapted — ported to
+Python/NumPy — from **Grow-Voxly** by **Shovith Debnath**:
+
+    https://github.com/Hawkay002/.Grow
+    https://grow-voxly.space
+
+Grow-Voxly is published without an explicit open-source license (default
+"all rights reserved"). The port in this repository is included **with credit
+and in good faith**, and the original author's permission has been requested.
+It is provided for **non-commercial, educational / portfolio** use and is
+**NOT licensed under this repository's MIT license**. If the original author
+requests removal, that file will be removed or independently rewritten.
+
+Original work
+-------------
+Everything else in this repository — the QR-conditioned voxel **diffusion
+model**, the training pipeline, and the in-browser **WebGPU inference** — is
+original work by the repository author and is covered by the MIT license in
+`LICENSE`.
