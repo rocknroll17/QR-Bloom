@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.3.0](https://github.com/rocknroll17/QR-Bloom/compare/v1.2.0...v1.3.0) (2026-06-09)
+
+
+### Features
+
+* **pages:** persist weights in Cache API keyed by content hash ([#62](https://github.com/rocknroll17/QR-Bloom/issues/62)) ([2bfc013](https://github.com/rocknroll17/QR-Bloom/commit/2bfc013702c85b1114819e3b12fed9e53c5ea4c7))
+
+
+### Bug Fixes
+
+* **pages:** bypass HTTP cache on download retry (stale 403) ([#61](https://github.com/rocknroll17/QR-Bloom/issues/61)) ([7a75399](https://github.com/rocknroll17/QR-Bloom/commit/7a75399cdf11b86f5a0dd202447f634eee1294b9))
+* **pages:** retry weight downloads + gate Generate on real readiness ([#59](https://github.com/rocknroll17/QR-Bloom/issues/59)) ([a5ff4fa](https://github.com/rocknroll17/QR-Bloom/commit/a5ff4fab1273d06b43f46908cd67751d789ef59a))
+* replace global inference lock with per-version locks ([#63](https://github.com/rocknroll17/QR-Bloom/issues/63)) ([9b8ba76](https://github.com/rocknroll17/QR-Bloom/commit/9b8ba765e2b59219ba55182cf7adaba803efce07))
+
 ## [1.2.0](https://github.com/rocknroll17/QR-Bloom/compare/v1.1.9...v1.2.0) (2026-06-06)
 
 
