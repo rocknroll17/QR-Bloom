@@ -8,13 +8,19 @@ Python/NumPy — from **Grow-Voxly** by **Shovith Debnath**:
 
     https://github.com/Hawkay002/.Grow
     https://grow-voxly.space
+    https://grow-voxly.vercel.app
 
-Grow-Voxly is published without an explicit open-source license (default
-"all rights reserved"). The port in this repository is included **with credit
-and in good faith**, and the original author's permission has been requested.
-It is provided for **non-commercial, educational / portfolio** use and is
-**NOT licensed under this repository's MIT license**. If the original author
-requests removal, that file will be removed or independently rewritten.
+This port is included **with the permission of the original author**, granted
+for **NON-COMMERCIAL use only**. It is **NOT licensed under this repository's
+MIT license**; commercial use of `qrbloom/treegen.py` requires separate
+permission from Shovith Debnath.
+
+Concept origin
+--------------
+The cherry-blossom QR-tree concept originates from **Enzo Manuel Mangano**
+(reactiive.io, @reactiive_), whose work inspired Grow-Voxly. QR-Bloom contains
+none of his code; its generator and diffusion model are independent
+implementations. Credit is given here as a courtesy.
 
 Original work
 -------------
