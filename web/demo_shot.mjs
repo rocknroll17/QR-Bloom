@@ -1,0 +1,17 @@
+import { createServer } from 'http';
+import { readFileSync, existsSync } from 'fs';
+import { extname, join } from 'path';
+import puppeteer from 'puppeteer';
+const DOCS=new URL('../docs/',import.meta.url).pathname;
+const MIME={'.html':'text/html','.js':'text/javascript','.json':'application/json'};
+const srv=createServer((q,s)=>{let p=q.url.split('?')[0].split('#')[0];if(p==='/')p='/embed-demo.html';const f=join(DOCS,p);
+ if(!existsSync(f)){s.writeHead(404);return s.end('404')};s.writeHead(200,{'content-type':MIME[extname(f)]||'text/plain'});s.end(readFileSync(f));});
+await new Promise(r=>srv.listen(0,r));const port=srv.address().port;
+const b=await puppeteer.launch({headless:'new',args:['--no-sandbox','--use-gl=swiftshader','--enable-unsafe-swiftshader']});
+const pg=await b.newPage();await pg.setViewport({width:760,height:820});
+const errs=[];pg.on('pageerror',e=>errs.push(e.message));
+await pg.goto(`http://localhost:${port}/embed-demo.html`,{waitUntil:'networkidle0',timeout:40000});
+await new Promise(r=>setTimeout(r,3500));
+console.log('pageerrors:',errs.length?errs.slice(0,3):'NONE ✅');
+await pg.screenshot({path:join(DOCS,'_demo_shot.png')});
+await b.close();srv.close();

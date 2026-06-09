@@ -1,0 +1,16 @@
+LicenseRef-GrowVoxly-NonCommercial
+==================================
+
+The file qrbloom/treegen.py is a Python/NumPy port of the procedural tree
+generator from Grow-Voxly by Shovith Debnath:
+    https://github.com/Hawkay002/.Grow
+    https://grow-voxly.space
+    https://grow-voxly.vercel.app
+
+It is included WITH THE PERMISSION of the original author, granted for
+NON-COMMERCIAL use only. Commercial use of this file requires separate
+permission from Shovith Debnath. This file is NOT licensed under the
+repository's MIT license.
+
+Concept origin: the cherry-blossom QR-tree concept is by Enzo Manuel Mangano
+(reactiive.io, @reactiive_); this port contains none of his code.
