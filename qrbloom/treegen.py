@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Shovith Debnath (Grow-Voxly); ported to Python by rocknroll17
+# SPDX-License-Identifier: LicenseRef-GrowVoxly-NonCommercial
+
 """treegen.py — QR-conditioned voxel tree generator (10 species).
 
 Attribution
@@ -11,7 +14,7 @@ Python/NumPy — from **Grow-Voxly** by **Shovith Debnath**:
 
 This port is included **with the permission of the original author**, Shovith
 Debnath, granted for NON-COMMERCIAL use only. It is NOT covered by this
-repository's MIT license (see NOTICE); commercial use requires separate
+repository's MIT license (see THIRD_PARTY_NOTICES.md); commercial use requires separate
 permission from the author. The diffusion model trained on this generator's
 output is original work.
 

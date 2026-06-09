@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 rocknroll17
+# SPDX-License-Identifier: MIT
+
 """gallery — interactive Three.js viewer for QR-Bloom voxel tree outputs.
 
 The training script writes per-epoch epoch_***.json files containing

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 rocknroll17
+# SPDX-License-Identifier: MIT
+
 """QR-Bloom training script.
 
 Trains a QR-conditioned 3D voxel tree diffusion model using v-prediction.

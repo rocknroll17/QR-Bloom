@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 rocknroll17
+# SPDX-License-Identifier: MIT
+
 """QR-code utilities: random QR generation and version-aware grid helpers.
 
 The diffusion model supports arbitrary QR versions (1..40). XY and Z both
