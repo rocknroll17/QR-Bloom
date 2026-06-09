@@ -63,9 +63,8 @@ jobs:
             # partial file.
             mkdir -p "${CHECKPOINTS}"
             for V in 2 3 4 5; do
-              for SUFFIX in "" "_best"; do
-                F="qrbloom_v${V}${SUFFIX}.pt"
-                URL="https://huggingface.co/${HF_REPO}/resolve/main/${F}"
+                F="qrbloom_v${V}_best.pt"
+                URL="https://huggingface.co/${HF_REPO}/resolve/main/checkpoints/${F}"
                 DEST="${CHECKPOINTS}/${F}"
                 remote_sha=$(curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" -I "${URL}" \
                   | tr -d '\r' \
@@ -92,7 +91,6 @@ jobs:
                 fi
                 mv "${DEST}.tmp" "${DEST}"
                 echo "  ${F}: synced"
-              done
             done
 
             echo "==> Pulling ${IMAGE}"
