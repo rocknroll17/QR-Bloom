@@ -264,16 +264,31 @@ class Diffusion:
         m = (cond > 0.5).float()                                # (B, 1, D, H, W)
         m_full = m.expand_as(v_pred)                            # (B, 4, D, H, W)
         sq = (v_pred - v_tgt) ** 2
-        per_sample = (sq * m_full).sum(dim=[1, 2, 3, 4]) / \
-                     m_full.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
-        L = per_sample.mean()
 
-        # Per-channel breakdowns (also per-sample, for fair logging).
+        # Per-sample occupancy pos_weight: up-weight occupied voxels to prevent
+        # sparse-occupancy collapse (e.g. palm/socotra where ~3% of the footprint
+        # is occupied). w = N_empty / N_occupied, capped at 12× to avoid
+        # over-aggressive gradients for very sparse themes.
+        # Applied only to the occupancy channel (ch 3); RGB (ch 0-2) unchanged.
+        occ_gt = (x0[:, 3:4] > 0).float() * m            # occupied & in footprint
+        n_occ  = occ_gt.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
+        n_foot = m.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
+        pos_w  = ((n_foot - n_occ) / n_occ).clamp(max=12.0)   # (B,)
+        pos_w  = pos_w.view(-1, 1, 1, 1, 1)                   # broadcast-ready
+
+        # RGB loss (ch 0-2): unweighted per-sample MSE in footprint.
         m_one = m.expand(-1, 3, -1, -1, -1)
         v_rgb_ps = (sq[:, :3] * m_one).sum(dim=[1, 2, 3, 4]) / \
                    m_one.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
-        v_occ_ps = (sq[:, 3:4] * m).sum(dim=[1, 2, 3, 4]) / \
-                   m.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
+
+        # Occupancy loss (ch 3): pos-weighted per-sample MSE in footprint.
+        v_occ_ps = (sq[:, 3:4] * m * pos_w).sum(dim=[1, 2, 3, 4]) / \
+                   (m * pos_w).sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
+
+        # Combined loss: average RGB + weighted occupancy, equal channel weight.
+        per_sample = (v_rgb_ps + v_occ_ps) / 4.0   # /4 keeps scale ≈ original
+        L = per_sample.mean()
+
         v_rgb = v_rgb_ps.mean().detach()
         v_occ = v_occ_ps.mean().detach()
         return L, {

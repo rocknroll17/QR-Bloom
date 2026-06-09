@@ -168,13 +168,10 @@ status: ## GPU usage + live trainings + latest val_total per version.
 	  --query-gpu=index,name,utilization.gpu,memory.used,memory.total \
 	  --format=csv,noheader
 	@echo ""
-	@echo "── Trainings ────────────────────────────────"
-	@pgrep -af "python.*train.py" || echo "  (no training running)"
-	@echo ""
 	@echo "── Latest epoch per version ─────────────────"
 	@for V in 2 3 4 5; do \
 	  L=$$(grep "val_total" runs_v$$V/train.log 2>/dev/null | tail -1); \
-	  printf "  v%s: %s\n" "$$V" "$${L:-(no log)}"; \
+	  printf "v%s: %s\n" "$$V" "$${L:-(no log)}"; \
 	done
 
 logs-v2: ## Follow v2's training log.

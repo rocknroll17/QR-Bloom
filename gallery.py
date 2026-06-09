@@ -36,7 +36,7 @@ LOG = os.path.join(RUNS_DIR, "train.log")
 # Model inference state — loaded lazily per version.
 # Each per-version checkpoint (qrbloom_v{N}.pt) is loaded on first use and
 # cached. Falls back to qrbloom.pt if a version-specific file isn't found.
-_model_lock = threading.Lock()
+_model_locks: dict = {}              # {version: Lock()} — per-version to allow parallel inference
 _model_ctx_per_version: dict = {}    # {version: {model, diff, ep, device, mtime, ...}}
 
 
@@ -219,7 +219,7 @@ def model_generate(url: str, theme_name: str, steps: int = 100,
     th_t = torch.tensor([theme_idx], device=dev).long()
     attr = torch.full((1, 3), 0.5, device=dev)
     ver_t = torch.tensor([int(version)], device=dev, dtype=torch.long)
-    with _model_lock, torch.no_grad():
+    with _model_locks.setdefault(version, threading.Lock()), torch.no_grad():
         x0 = ctx["diff"].sample(ctx["model"], cond, th_t, attr=attr, steps=steps,
                                 device=dev, eta=1.0, version=ver_t).cpu().numpy()[0]
     occ = (x0[3] > 0)
