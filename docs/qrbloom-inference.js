@@ -507,8 +507,3 @@ export async function generate({ url, theme, onPhase }) {
   const cells = buildCells(x0, D, H, W, qr, themeMeta);
   return { cells, version: qr.version, theme: themeMeta.name, url };
 }
-
-// --- progress observers ----------------------------------------------------
-
-const _listeners = new Set();
-export function onDownloadProgress(fn) { _listeners.add(fn); return () => _listeners.delete(fn); }
