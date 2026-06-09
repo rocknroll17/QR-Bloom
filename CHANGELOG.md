@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.1](https://github.com/rocknroll17/QR-Bloom/compare/v1.3.0...v1.3.1) (2026-06-09)
+
+
+### Documentation
+
+* attribution — permission granted (non-commercial) + vercel link + credit Enzo ([#66](https://github.com/rocknroll17/QR-Bloom/issues/66)) ([530f671](https://github.com/rocknroll17/QR-Bloom/commit/530f6710504c6596a6b09065f9dccc3aa51febe0))
+* credit Grow-Voxly for tree-gen algorithm + NOTICE ([#64](https://github.com/rocknroll17/QR-Bloom/issues/64)) ([1964b82](https://github.com/rocknroll17/QR-Bloom/commit/1964b82b848f1518081a1bba03ba3f676359ee1e))
+
 ## [1.3.0](https://github.com/rocknroll17/QR-Bloom/compare/v1.2.0...v1.3.0) (2026-06-09)
 
 
