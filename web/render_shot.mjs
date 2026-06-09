@@ -1,0 +1,16 @@
+import { createServer } from 'http';
+import { readFileSync, existsSync } from 'fs';
+import { extname, join } from 'path';
+import puppeteer from 'puppeteer';
+const ROOT=new URL('../docs/',import.meta.url).pathname;
+const MIME={'.html':'text/html','.js':'text/javascript','.json':'application/json'};
+const srv=createServer((q,s)=>{let p=q.url.split('?')[0];if(p==='/')p='/_shot.html';const f=join(ROOT,p);
+ if(!existsSync(f)){s.writeHead(404);return s.end()};s.writeHead(200,{'content-type':MIME[extname(f)]||'text/plain'});s.end(readFileSync(f));});
+await new Promise(r=>srv.listen(0,r)); const port=srv.address().port;
+const b=await puppeteer.launch({headless:'new',args:['--no-sandbox','--use-gl=swiftshader']});
+const pg=await b.newPage(); await pg.setViewport({width:700,height:600});
+pg.on('console',m=>console.log('[pg]',m.text())); pg.on('pageerror',e=>console.log('[err]',e.message));
+await pg.goto(`http://localhost:${port}/_shot.html`,{waitUntil:'networkidle0',timeout:30000});
+await new Promise(r=>setTimeout(r,2500));
+await pg.screenshot({path:new URL('../docs/_render_shot.png',import.meta.url).pathname});
+console.log('shot saved'); await b.close(); srv.close();

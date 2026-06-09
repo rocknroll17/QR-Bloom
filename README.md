@@ -16,7 +16,7 @@ viewed from above it is a working QR code.
 > QR-Bloom's own contribution is the **diffusion model** that *learns* to generate
 > them as scannable QR codes, plus the in-browser WebGPU inference. The ported
 > generator (`qrbloom/treegen.py`) is **not** covered by this repo's MIT license —
-> see [NOTICE](NOTICE). The original cherry-blossom QR-tree concept is by
+> see [NOTICE](THIRD_PARTY_NOTICES.md). The original cherry-blossom QR-tree concept is by
 > [Enzo Manuel Mangano](https://reactiive.io) (@reactiive_).
 
 ### Try it

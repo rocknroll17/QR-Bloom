@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 rocknroll17
+# SPDX-License-Identifier: MIT
+
 """Denoising diffusion model for 3D voxel tree generation conditioned on a QR footprint.
 
 The model generates a 4-channel (RGB + occupancy) voxel grid of shape

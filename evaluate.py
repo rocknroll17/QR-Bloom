@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 rocknroll17
+# SPDX-License-Identifier: MIT
+
 """Quantitative evaluation for QR-Bloom.
 
 Measures four properties of generated voxel trees against treegen ground truth:

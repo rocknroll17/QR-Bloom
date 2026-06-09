@@ -1,0 +1,28 @@
+import { createServer } from 'http';
+import { readFileSync, existsSync } from 'fs';
+import { extname, join } from 'path';
+import { gzipSync } from 'zlib';
+import puppeteer from 'puppeteer';
+const DOCS = new URL('../docs/', import.meta.url).pathname;
+const { cells } = JSON.parse(readFileSync(join(DOCS,'_cells.json'),'utf8'));
+const json = JSON.stringify(cells);
+const enc = gzipSync(Buffer.from(json)).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+console.log(`cells=${cells.length}  json=${json.length}B  gzip+b64url=${enc.length}B  (iframe URL adds ~${enc.length}B)`);
+
+const MIME={'.html':'text/html','.js':'text/javascript','.json':'application/json'};
+const srv=createServer((q,s)=>{let p=q.url.split('?')[0].split('#')[0];const f=join(DOCS,p);
+ if(!existsSync(f)){s.writeHead(404);return s.end('404')};s.writeHead(200,{'content-type':MIME[extname(f)]||'text/plain'});s.end(readFileSync(f));});
+await new Promise(r=>srv.listen(0,r)); const port=srv.address().port;
+const b=await puppeteer.launch({headless:'new',args:['--no-sandbox','--use-gl=swiftshader','--enable-unsafe-swiftshader']});
+const pg=await b.newPage(); await pg.setViewport({width:420,height:420});
+const errs=[];
+pg.on('pageerror',e=>errs.push('PAGEERR: '+e.message));
+pg.on('console',m=>{if(m.type()==='error'&&!/favicon/.test(m.text()))errs.push('ERR: '+m.text());});
+await pg.goto(`http://localhost:${port}/embed.html#${enc}`,{waitUntil:'networkidle0',timeout:40000});
+await new Promise(r=>setTimeout(r,3000));
+const info=await pg.evaluate(()=>{const c=document.querySelector('canvas');const err=document.getElementById('err');
+  return {canvas:!!c, errVisible: err && err.style.display!=='none', errText: err?err.textContent:''};});
+console.log('errors:', errs.length?errs.slice(0,5):'NONE ✅');
+console.log('state:', JSON.stringify(info));
+await pg.screenshot({path:join(DOCS,'_embed_iframe.png')});
+await b.close(); srv.close();
