@@ -239,7 +239,7 @@ let _embedCells = [];
 
 function showCells(cells) {
   _embedCells = cells || [];
-  viewer.setCells(cells);
+  viewer.setCells(cells, true);   // animate: grow the new tree in from the ground up
   // reveal the view / export buttons once there's something to act on
   // (drops .pending — the row kept its space, so nothing jumps; status stays)
   document.getElementById('controls-row').classList.remove('pending');

@@ -54,6 +54,16 @@ export class Viewer {
     this._scene.add(this._root);
     this._boxGeo = new THREE.BoxGeometry(1, 1, 1);
 
+    // Growth-reveal animation: new trees pop in voxel-by-voxel from the ground
+    // up (see setCells(..., animate=true) and _updateGrowth).
+    this._growthItems = [];
+    this._growing = false;
+    this._growthStart = 0;
+    this._gM = new THREE.Matrix4();
+    this._gP = new THREE.Vector3();
+    this._gQ = new THREE.Quaternion();
+    this._gS = new THREE.Vector3();
+
     this._onResize = this._onResize.bind(this);
     addEventListener('resize', this._onResize);
 
@@ -134,8 +144,10 @@ export class Viewer {
    * Replace the rendered voxels with a new cell list.
    * Each cell is `[x, y, z, scale, color]` where y == 0 marks QR base voxels.
    */
-  setCells(cells) {
+  setCells(cells, animate = false) {
     this._clearRoot();
+    this._growthItems = [];
+    this._growing = false;
     if (!cells || !cells.length) return;
 
     // Map (x, z) -> QR module color from the base layer (y == 0). Tree voxels
@@ -149,9 +161,13 @@ export class Viewer {
     // tree voxels still cast onto them. All groups share a white material and
     // per-instance color (lerped between treeCol and qrCol).
     const groups = new Map();
+    const treeSet = new Set();          // "x,y,z" of tree (non-base) voxels
+    let maxY = 0, minTreeY = Infinity;
     for (const c of cells) {
       const [x, y, z, scale, color] = c;
+      if (y > maxY) maxY = y;
       const isBase = (y === 0);
+      if (!isBase) { treeSet.add(x + ',' + y + ',' + z); if (y < minTreeY) minTreeY = y; }
       const key = scale + '|' + (isBase ? 'b' : 't');
       if (!groups.has(key)) groups.set(key, { scale, isBase, items: [] });
       groups.get(key).items.push({
@@ -160,10 +176,43 @@ export class Viewer {
         qrCol: new THREE.Color(isBase ? color : (qrUnder.get(x + ',' + z) || color)),
       });
     }
+    const span = Math.max(1, maxY);
+    // Deterministic hash for a little per-voxel reveal jitter.
+    const hash = (x, y, z) => {
+      const s = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719) * 43758.5453;
+      return s - Math.floor(s);
+    };
+
+    // Reveal order: BFS over the *tree* voxels (26-connectivity) seeded from the
+    // trunk base, so growth climbs the trunk and spreads out to the branches and
+    // canopy like a real tree — not a flat layer-by-layer stack. dist = graph
+    // steps from the base; disconnected clusters fall back to their height.
+    const dist = new Map();
+    let maxD = 1;
+    if (animate && treeSet.size) {
+      const q = [];
+      for (const k of treeSet) {
+        if (Number(k.split(',')[1]) <= minTreeY) { dist.set(k, 0); q.push(k); }
+      }
+      const NB = [];
+      for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++)
+        if (dx || dy || dz) NB.push([dx, dy, dz]);
+      for (let head = 0; head < q.length; head++) {
+        const k = q[head], d = dist.get(k);
+        const [x, y, z] = k.split(',').map(Number);
+        for (const [dx, dy, dz] of NB) {
+          const nk = (x + dx) + ',' + (y + dy) + ',' + (z + dz);
+          if (treeSet.has(nk) && !dist.has(nk)) {
+            dist.set(nk, d + 1); if (d + 1 > maxD) maxD = d + 1; q.push(nk);
+          }
+        }
+      }
+    }
 
     const M = new THREE.Matrix4();
     const Q = new THREE.Quaternion();
     const P = new THREE.Vector3();
+    const SV = new THREE.Vector3();
     for (const { scale, isBase, items } of groups.values()) {
       const mat = new THREE.MeshStandardMaterial({
         color: 0xffffff, roughness: 0.9, metalness: 0.0,
@@ -171,18 +220,38 @@ export class Viewer {
       const mesh = new THREE.InstancedMesh(this._boxGeo, mat, items.length);
       mesh.castShadow = !isBase;
       mesh.receiveShadow = true;
-      const S = new THREE.Vector3(scale, scale, scale);
       for (let i = 0; i < items.length; i++) {
-        P.set(items[i].pos[0], items[i].pos[1], items[i].pos[2]);
-        M.compose(P, Q, S);
+        const p = items[i].pos;
+        P.set(p[0], p[1], p[2]);
+        SV.setScalar(animate ? 0.0001 : scale);   // start hidden when animating
+        M.compose(P, Q, SV);
         mesh.setMatrixAt(i, M);
         this._tmpColor.copy(items[i].treeCol).lerp(items[i].qrCol, this._blendFactor);
         mesh.setColorAt(i, this._tmpColor);
+        if (animate) {
+          let revealAt;
+          if (p[1] === 0) {
+            revealAt = 0.02;                                   // QR ground forms first
+          } else {
+            const k = p[0] + ',' + p[1] + ',' + p[2];
+            const d = dist.has(k) ? dist.get(k) / maxD         // BFS growth distance
+                                  : (p[1] - minTreeY) / span;  // disconnected -> height
+            revealAt = 0.08 + 0.88 * d;
+          }
+          revealAt += (hash(p[0], p[1], p[2]) - 0.5) * 0.05;
+          revealAt = Math.max(0, Math.min(0.95, revealAt));
+          this._growthItems.push({ mesh, i, px: p[0], py: p[1], pz: p[2], scale, revealAt });
+        }
       }
       mesh.instanceMatrix.needsUpdate = true;
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
       this._root.add(mesh);
       this._meshInstances.push({ mesh, items });
+    }
+
+    if (animate && this._growthItems.length) {
+      this._growing = true;
+      this._growthStart = performance.now();
     }
   }
 
@@ -233,6 +302,39 @@ export class Viewer {
       }
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     }
+  }
+
+  // Advance the bottom-up grow-in. Each voxel scales 0 -> full (with a small
+  // easeOutBack overshoot for a "pop") once the rising growth front passes its
+  // height. Runs only for ~DURATION ms after a new animated tree, then stops.
+  _updateGrowth() {
+    const DURATION = 1400;   // ms for the whole tree to finish growing
+    const WINDOW = 0.28;     // how long one voxel takes to pop (reveal units)
+    const p = Math.min(1, (performance.now() - this._growthStart) / DURATION);
+    // The reveal front sweeps 0 -> (1 + WINDOW), so even the last voxel
+    // (revealAt up to ~1) completes its full window — its `local` reaches 1 and
+    // it settles at exactly scale 1. (Capping the front at 1 left late canopy
+    // voxels permanently undersized.) The easeOutBack still overshoots mid-pop
+    // for the bounce, but lands cleanly on 1.
+    const front = p * (1 + WINDOW);
+    const M = this._gM, P = this._gP, Q = this._gQ, S = this._gS;
+    const c1 = 1.70158, c3 = c1 + 1;
+    const touched = new Set();
+    for (const it of this._growthItems) {
+      let local = (front - it.revealAt) / WINDOW;
+      local = local <= 0 ? 0 : (local >= 1 ? 1 : local);
+      let s;
+      if (local <= 0) s = 0.0001;
+      else if (local >= 1) s = 1;                                  // settle exactly at 1
+      else { const x = local - 1; s = 1 + c3 * x * x * x + c1 * x * x; }  // easeOutBack bounce
+      S.setScalar(it.scale * s);
+      P.set(it.px, it.py, it.pz);
+      M.compose(P, Q, S);
+      it.mesh.setMatrixAt(it.i, M);
+      touched.add(it.mesh);
+    }
+    for (const mesh of touched) mesh.instanceMatrix.needsUpdate = true;
+    if (p >= 1) { this._growing = false; this._growthItems = []; }
   }
 
   _onResize() {
@@ -306,6 +408,8 @@ export class Viewer {
       bt = Math.max(0, Math.min(1, bt));
       this._targetBlend = bt * bt * (3 - 2 * bt);
     }
+
+    if (this._growing) this._updateGrowth();
 
     this.controls.update();
     this.renderer.render(this._scene, this.camera);
