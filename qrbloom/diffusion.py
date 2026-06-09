@@ -268,25 +268,34 @@ class Diffusion:
         m_full = m.expand_as(v_pred)                            # (B, 4, D, H, W)
         sq = (v_pred - v_tgt) ** 2
 
-        # Per-sample occupancy pos_weight: up-weight occupied voxels to prevent
+        # Per-voxel occupancy pos_weight: up-weight occupied voxels to prevent
         # sparse-occupancy collapse (e.g. palm/socotra where ~3% of the footprint
         # is occupied). w = N_empty / N_occupied, capped at 12× to avoid
         # over-aggressive gradients for very sparse themes.
         # Applied only to the occupancy channel (ch 3); RGB (ch 0-2) unchanged.
+        #
+        # NOTE: pos_w must be a PER-VOXEL weight map, not a per-sample scalar.
+        # A per-sample scalar cancels algebraically in the normalised loss:
+        #   (sq * m * s).sum() / (m * s).sum()  ==  (sq * m).sum() / m.sum()
+        # To actually up-weight occupied voxels we build a spatial weight map
+        # where occupied voxels get pos_w and empty (but in-footprint) voxels
+        # get 1.0, so the ratio between them is preserved after normalisation.
         occ_gt = (x0[:, 3:4] > 0).float() * m            # occupied & in footprint
         n_occ  = occ_gt.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
         n_foot = m.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
-        pos_w  = ((n_foot - n_occ) / n_occ).clamp(max=12.0)   # (B,)
+        pos_w  = ((n_foot - n_occ) / n_occ).clamp(max=12.0)   # (B,) scalar ratio
         pos_w  = pos_w.view(-1, 1, 1, 1, 1)                   # broadcast-ready
+        # Spatial weight map: occ voxels → pos_w, empty-in-footprint → 1.0
+        vox_w  = occ_gt * pos_w + (1.0 - occ_gt) * m          # (B, 1, D, H, W)
 
         # RGB loss (ch 0-2): unweighted per-sample MSE in footprint.
         m_one = m.expand(-1, 3, -1, -1, -1)
         v_rgb_ps = (sq[:, :3] * m_one).sum(dim=[1, 2, 3, 4]) / \
                    m_one.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
 
-        # Occupancy loss (ch 3): pos-weighted per-sample MSE in footprint.
-        v_occ_ps = (sq[:, 3:4] * m * pos_w).sum(dim=[1, 2, 3, 4]) / \
-                   (m * pos_w).sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
+        # Occupancy loss (ch 3): per-voxel pos-weighted MSE in footprint.
+        v_occ_ps = (sq[:, 3:4] * vox_w).sum(dim=[1, 2, 3, 4]) / \
+                   vox_w.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
 
         # Combined loss: average RGB + weighted occupancy, equal channel weight.
         per_sample = (v_rgb_ps + v_occ_ps) / 4.0   # /4 keeps scale ≈ original
