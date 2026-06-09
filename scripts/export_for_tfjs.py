@@ -14,10 +14,11 @@ from qrbloom.diffusion import UNet3D, Diffusion, X0_CH, N_THEMES
 from qrbloom.qr import grid_xy_for_version, grid_z_for_version
 
 OUT = "docs/assets"; os.makedirs(OUT, exist_ok=True)
+CKPT_DIR = os.environ.get("QRBLOOM_CKPT_DIR", "checkpoints")
 HF_MANIFEST = "https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/onnx/manifest.json"
 
 def export_version(V):
-    ckpt = f"checkpoints/qrbloom_v{V}_best.pt"
+    ckpt = os.path.join(CKPT_DIR, f"qrbloom_v{V}_best.pt")
     if not os.path.exists(ckpt):
         print(f"v{V}: no checkpoint, skip"); return None
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
