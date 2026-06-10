@@ -138,6 +138,10 @@ if torch.cuda.is_available():
 
 # Loss keys used for logging and aggregation.
 LOSS_KEYS = ("v_mse", "v_rgb", "v_occ")
+# Step 3b: difficulty-aware class balancing — up-weight species the model is
+# currently worst at (measured by a running per-species loss). Set False to
+# disable and fall back to uniform per-species weighting.
+CLS_BALANCE = True
 
 
 class LiveTreeDataset(torch.utils.data.Dataset):
@@ -364,7 +368,8 @@ def evaluate(model, diff, loader, device) -> dict:
             with torch.amp.autocast("cuda", dtype=_AMP_TH):
                 loss, info = diff.p_losses(model, x0, cond, theme, attr, version=ver)
             for k, v in info.items():
-                parts_sum[k] += v.item()
+                if k in parts_sum:                       # skip per_sample/theme tensors
+                    parts_sum[k] += v.item()
             parts_sum["total"] += loss.item()
             # Inject fixed small-t noise, recover x0, threshold occupancy for IoU.
             tb = torch.full((x0.size(0),), t_probe, dtype=torch.long, device=device)
@@ -649,6 +654,11 @@ def main():
 
     total_steps = EPOCHS * len(train_dl)
     cur_step = (start_epoch - 1) * len(train_dl)
+    # Step 3b state: running per-species loss (higher → harder → up-weighted).
+    theme_loss_ema = torch.ones(len(DS_THEMES), device=DEVICE)
+    # Step 3c: pick the best checkpoint by validation occupancy IoU (sample
+    # quality), NOT val MSE — MSE keeps dropping while samples can degrade.
+    best_iou = max([h.get("val_iou", 0.0) for h in hist], default=-1.0)
 
     # ─── Training loop ────────────────────────────────────────────────────────
     for ep in range(start_epoch, EPOCHS + 1):
@@ -668,9 +678,17 @@ def main():
             attr = attr_b.to(DEVICE, non_blocking=True)
             ver = ver_b.to(DEVICE, non_blocking=True)
 
+            # Step 3b: per-batch class weights from the running per-species loss
+            # (clamped so balancing is gentle and never starves a species).
+            if CLS_BALANCE:
+                w = theme_loss_ema[theme] / theme_loss_ema.mean().clamp(min=1e-6)
+                cls_weight = w.clamp(0.5, 2.5)
+            else:
+                cls_weight = None
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=_AMP_TH):
-                loss, info = diff.p_losses(model, x0, cond, theme, attr, version=ver)
+                loss, info = diff.p_losses(model, x0, cond, theme, attr, version=ver,
+                                           cls_weight=cls_weight)
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -685,7 +703,18 @@ def main():
             cur_step += 1
             n_batches += 1
 
-            for k, v in info.items(): epoch_parts[k] += v.item()
+            # Step 3b: update the running per-species loss from this batch.
+            if CLS_BALANCE:
+                with torch.no_grad():
+                    ps, th = info["per_sample"], info["theme"]
+                    for c in range(len(DS_THEMES)):
+                        sel = (th == c)
+                        if sel.any():
+                            theme_loss_ema[c] = (0.98 * theme_loss_ema[c]
+                                                 + 0.02 * ps[sel].mean())
+
+            for k, v in info.items():
+                if k in epoch_parts: epoch_parts[k] += v.item()   # skip tensors
             epoch_parts["total"] += loss.item()
             if IS_MAIN and n_batches % 10 == 0:
                 pbar.set_postfix(loss=f"{loss.item():.3f}",
@@ -739,10 +768,10 @@ def main():
                      "opt": opt.state_dict(), "scaler": scaler.state_dict(),
                      "epoch": ep, "hist": hist}
             _safe_save(state, CKPT)
-            if val_metrics["total"] < best_val:
-                best_val = val_metrics["total"]
+            if val_metrics["iou"] > best_iou:
+                best_iou = val_metrics["iou"]
                 _safe_save(state, CKPT_BEST)
-                log(f"  new best val_total={best_val:.4f}")
+                log(f"  new best val_iou={best_iou:.3f}")
         if IS_DIST:
             dist.barrier()
 

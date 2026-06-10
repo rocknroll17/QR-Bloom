@@ -97,6 +97,11 @@ class UNet3D(nn.Module):
         self.attr_mlp = nn.Sequential(nn.Linear(3, tdim), nn.SiLU(),
                                       nn.Linear(tdim, tdim))
         self.attr_null = nn.Parameter(torch.zeros(tdim))
+        # Learnable null token for classifier-free guidance on the SPECIES
+        # condition (mirrors attr_null). Lets weak species be amplified at
+        # sampling via theme-CFG. NOTE: adds one parameter — old checkpoints
+        # must be loaded with strict=False (or trained fresh).
+        self.theme_null = nn.Parameter(torch.zeros(tdim))
 
         # ── encoder ──────────────────────────────────────────────────────
         self.in_conv = nn.Conv3d(X0_CH + 1, ch, 3, padding=1)
@@ -117,20 +122,27 @@ class UNet3D(nn.Module):
         self.head_norm = nn.GroupNorm(8, ch)
         self.head_conv = nn.Conv3d(ch, X0_CH, 3, padding=1)
 
-    def forward(self, x, t, cond, theme, attr, attr_mask=None, version=None):
+    def forward(self, x, t, cond, theme, attr, attr_mask=None, version=None,
+                theme_mask=None):
         """Forward pass.
 
         Args:
-            x:         Noised voxel grid, shape (B, 4, D, H, W).
-            t:         Timestep indices, shape (B,).
-            cond:      QR footprint mask, shape (B, 1, D, H, W).
-            theme:     Theme indices, shape (B,).
-            attr:      Shape attribute vector, shape (B, 3), values in [0, 1].
-            attr_mask: Binary mask, shape (B,). 1 = use attr conditioning,
-                       0 = use unconditional null token (CFG training).
-            version:   Accepted for backward compat, ignored (single-version model).
+            x:          Noised voxel grid, shape (B, 4, D, H, W).
+            t:          Timestep indices, shape (B,).
+            cond:       QR footprint mask, shape (B, 1, D, H, W).
+            theme:      Theme indices, shape (B,).
+            attr:       Shape attribute vector, shape (B, 3), values in [0, 1].
+            attr_mask:  Binary mask, shape (B,). 1 = use attr conditioning,
+                        0 = use unconditional null token (CFG training).
+            version:    Accepted for backward compat, ignored (single-version).
+            theme_mask: Binary mask, shape (B,). 1 = use the species embedding,
+                        0 = use the null token (theme-CFG). None = always use it.
         """
-        temb = self.tmlp(timestep_embedding(t, self.ch)) + self.theme_emb(theme)
+        theme_e = self.theme_emb(theme)
+        if theme_mask is not None:
+            tmk = theme_mask.view(-1, 1).float()
+            theme_e = tmk * theme_e + (1.0 - tmk) * self.theme_null
+        temb = self.tmlp(timestep_embedding(t, self.ch)) + theme_e
         attr_emb = self.attr_mlp(attr)
         if attr_mask is not None:
             m = attr_mask.view(-1, 1).float()
@@ -167,9 +179,23 @@ class Diffusion:
     """
 
     def __init__(self, T: int = 500, device: str = "cuda", rgb_weight: float = 1.5,
-                 occ_color_w: float = 20.0):
+                 occ_color_w: float = 20.0,
+                 min_snr_gamma: float = 5.0, occ_pos_cap: float = 4.0,
+                 theme_drop: float = 0.1, mask_rgb_to_occ: bool = True):
         self.rgb_weight = float(rgb_weight)
         self.occ_color_w = float(occ_color_w)
+        # --- robustness knobs (see p_losses / sample) ---------------------
+        # min_snr_gamma: Min-SNR-γ timestep loss weighting (v-pred). Set huge
+        #                (e.g. 1e9) to disable → uniform timestep weighting.
+        # occ_pos_cap:   cap on the occupancy up-weight ratio (was a hard 12×,
+        #                which over-filled sparse species). Lower = gentler.
+        # theme_drop:    CFG dropout prob on the SPECIES condition (theme-CFG).
+        # mask_rgb_to_occ: compute the colour loss only on occupied voxels
+        #                (empty-voxel colour is meaningless and dominates).
+        self.min_snr_gamma = float(min_snr_gamma)
+        self.occ_pos_cap = float(occ_pos_cap)
+        self.theme_drop = float(theme_drop)
+        self.mask_rgb_to_occ = bool(mask_rgb_to_occ)
         self.T = T
         self.betas = cosine_beta_schedule(T).to(device)
         self.alphas = 1.0 - self.betas
@@ -225,7 +251,8 @@ class Diffusion:
         b = self.sqrt_one_minus_acp[t][:, None, None, None, None]
         return b * x_t + a * v
 
-    def p_losses(self, model, x0, cond, theme, attr, attr_drop=0.15, version=None):
+    def p_losses(self, model, x0, cond, theme, attr, attr_drop=0.15, version=None,
+                 cls_weight=None):
         """v-prediction MSE training loss with CFG attribute dropout.
 
         Loss is **masked to columns under a dark QR module** (`cond > 0.5`).
@@ -249,9 +276,12 @@ class Diffusion:
         t = torch.randint(0, self.T, (x0.size(0),), device=x0.device)
         noise = torch.randn_like(x0)
         x_t = self.q_sample(x0, t, noise)
-        # Drop attribute conditioning with probability attr_drop for CFG training.
-        attr_mask = (torch.rand(x0.size(0), device=x0.device) >= attr_drop).float()
-        v_pred = model(x_t, t, cond, theme, attr, attr_mask, version)   # (B, 4, D, H, W)
+        # CFG dropout: independently drop the attribute AND the species (theme)
+        # conditions to their null tokens, enabling classifier-free guidance on
+        # both at inference (theme-CFG sharpens weak species).
+        attr_mask  = (torch.rand(x0.size(0), device=x0.device) >= attr_drop).float()
+        theme_mask = (torch.rand(x0.size(0), device=x0.device) >= self.theme_drop).float()
+        v_pred = model(x_t, t, cond, theme, attr, attr_mask, version, theme_mask)
         v_tgt = self.v_target(x0, t, noise)
 
         # Footprint mask: columns above DARK QR modules. Same shape as v_pred
@@ -283,23 +313,36 @@ class Diffusion:
         occ_gt = (x0[:, 3:4] > 0).float() * m            # occupied & in footprint
         n_occ  = occ_gt.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
         n_foot = m.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
-        pos_w  = ((n_foot - n_occ) / n_occ).clamp(max=12.0)   # (B,) scalar ratio
+        pos_w  = ((n_foot - n_occ) / n_occ).clamp(max=self.occ_pos_cap)  # (B,) ratio
         pos_w  = pos_w.view(-1, 1, 1, 1, 1)                   # broadcast-ready
         # Spatial weight map: occ voxels → pos_w, empty-in-footprint → 1.0
         vox_w  = occ_gt * pos_w + (1.0 - occ_gt) * m          # (B, 1, D, H, W)
 
-        # RGB loss (ch 0-2): unweighted per-sample MSE in footprint.
-        m_one = m.expand(-1, 3, -1, -1, -1)
-        v_rgb_ps = (sq[:, :3] * m_one).sum(dim=[1, 2, 3, 4]) / \
-                   m_one.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
+        # RGB loss (ch 0-2): the colour of empty space is meaningless and would
+        # dominate the loss, so by default mask the colour loss to OCCUPIED
+        # voxels only. This decouples colour from the empty majority — most of
+        # the benefit of a two-stage shape→colour split, without a 2nd network.
+        rgb_mask  = occ_gt if self.mask_rgb_to_occ else m
+        rgb_mask3 = rgb_mask.expand(-1, 3, -1, -1, -1)
+        v_rgb_ps = (sq[:, :3] * rgb_mask3).sum(dim=[1, 2, 3, 4]) / \
+                   rgb_mask3.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
 
         # Occupancy loss (ch 3): per-voxel pos-weighted MSE in footprint.
         v_occ_ps = (sq[:, 3:4] * vox_w).sum(dim=[1, 2, 3, 4]) / \
                    vox_w.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
 
-        # Combined loss: average RGB + weighted occupancy, equal channel weight.
         per_sample = (v_rgb_ps + v_occ_ps) / 4.0   # /4 keeps scale ≈ original
-        L = per_sample.mean()
+
+        # Min-SNR-γ timestep weighting (v-prediction → w = min(SNR,γ)/(SNR+1)).
+        # Diffusion training is multi-task across timesteps; uniform weighting
+        # lets the steps fight each other. This balances them. γ→∞ disables.
+        snr   = self.acp[t] / (1.0 - self.acp[t]).clamp(min=1e-8)
+        snr_w = torch.clamp(snr, max=self.min_snr_gamma) / (snr + 1.0)
+        # Difficulty-aware class balancing: up-weight hard species (B,) or none.
+        if cls_weight is not None:
+            snr_w = snr_w * cls_weight
+        # Weighted mean keeps the loss magnitude stable (no LR retuning needed).
+        L = (per_sample * snr_w).sum() / snr_w.sum().clamp(min=1e-8)
 
         v_rgb = v_rgb_ps.mean().detach()
         v_occ = v_occ_ps.mean().detach()
@@ -307,6 +350,8 @@ class Diffusion:
             "v_mse": L.detach(),
             "v_rgb": v_rgb,
             "v_occ": v_occ,
+            "per_sample": per_sample.detach(),   # (B,) — for per-species balancing
+            "theme": theme.detach(),             # (B,)
         }
 
     @torch.no_grad()
@@ -343,9 +388,11 @@ class Diffusion:
         seq = torch.linspace(self.T - 1, 0, steps).long().tolist()
         for idx, t in enumerate(seq):
             tb = torch.full((n,), t, device=device, dtype=torch.long)
-            v_cond = model(x, tb, cond, theme, attr, m1, version)
+            v_cond = model(x, tb, cond, theme, attr, m1, version, m1)
             if cfg != 1.0:
-                v_uncond = model(x, tb, cond, theme, attr, m0, version)
+                # Unconditional = null BOTH the species and the attributes, so
+                # guidance amplifies the species identity (theme-CFG) too.
+                v_uncond = model(x, tb, cond, theme, attr, m0, version, m0)
                 v_pred = v_uncond + cfg * (v_cond - v_uncond)
             else:
                 v_pred = v_cond
