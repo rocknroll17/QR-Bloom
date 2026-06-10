@@ -32,7 +32,11 @@ def _serve_template(name: str) -> HTMLResponse:
     )
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-RUNS_DIR = os.path.join(ROOT, "runs")
+# Match train.py's output dir, which is `runs{VARIANT}` (e.g. VARIANT=_v2 ->
+# runs_v2). Run the gallery with the SAME VARIANT to watch that run's montages
+# (otherwise it reads the default `runs/` and shows a stale/other run).
+VARIANT = os.environ.get("VARIANT", "")
+RUNS_DIR = os.path.join(ROOT, f"runs{VARIANT}")
 CKPT_DIR = os.path.join(ROOT, "checkpoints")
 LOG = os.path.join(RUNS_DIR, "train.log")
 
