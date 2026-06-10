@@ -273,3 +273,7 @@ SCRATCH.md
 .vscode/
 *.swp
 *.swo
+
+# Playwright
+.playwright*
+playwright-report/
