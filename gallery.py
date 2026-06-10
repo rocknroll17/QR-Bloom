@@ -435,7 +435,7 @@ def route_state():
 # can survive into the path expression.
 
 @app.get("/img/{name}")
-def route_img(name: str):
+def route_img(name: str, variant: str = ""):
     if name == "loss.png":
         clean = "loss.png"
     elif (m := re.fullmatch(r'epoch_(\d+)\.png', name)):
@@ -443,7 +443,8 @@ def route_img(name: str):
         clean = f"epoch_{int(m.group(1)):03d}.png"
     else:
         return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    full = _safe_path_in(RUNS_DIR, clean) or _safe_path_in(ROOT, clean)
+    base = os.path.join(ROOT, f"runs{_safe_variant(variant)}")
+    full = _safe_path_in(base, clean) or _safe_path_in(RUNS_DIR, clean) or _safe_path_in(ROOT, clean)
     if not full or not os.path.exists(full):
         return Response(content=b"not found", status_code=404, media_type="text/plain")
     with open(full, "rb") as f:
@@ -453,7 +454,7 @@ def route_img(name: str):
 
 
 @app.get("/data/{name}")
-def route_data(name: str):
+def route_data(name: str, variant: str = ""):
     if name == "unseen_gt.json":
         clean = "unseen_gt.json"
     elif (m := re.fullmatch(r'ep(\d+)\.json', name)):
@@ -461,7 +462,8 @@ def route_data(name: str):
         clean = f"epoch_{int(m.group(1)):03d}.json"
     else:
         return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    full = _safe_path_in(RUNS_DIR, clean) or _safe_path_in(ROOT, clean)
+    base = os.path.join(ROOT, f"runs{_safe_variant(variant)}")
+    full = _safe_path_in(base, clean) or _safe_path_in(RUNS_DIR, clean) or _safe_path_in(ROOT, clean)
     if not full or not os.path.exists(full):
         return Response(content=b"not found", status_code=404, media_type="text/plain")
     with open(full, "rb") as f:
@@ -475,6 +477,33 @@ class _GenerateBody(BaseModel):
     theme: str = "cherryblossom"
     # None => auto-pick from text; explicit integer overrides for debugging.
     version: int | None = None
+
+
+def _safe_variant(v: str) -> str:
+    """Validate a runs-dir variant suffix (e.g. '' or '_v2')."""
+    v = v or ""
+    return v if re.fullmatch(r'_?[a-zA-Z0-9]{0,8}', v) else ""
+
+
+def _list_variants() -> dict:
+    """Every runs{VARIANT} dir + its latest epoch (for monitoring parallel runs)."""
+    out = {}
+    for name in sorted(os.listdir(ROOT)):
+        d = os.path.join(ROOT, name)
+        if not (name.startswith("runs") and os.path.isdir(d)):
+            continue
+        eps = [int(m.group(1)) for f in os.listdir(d)
+               for m in [re.fullmatch(r'epoch_(\d+)\.png', f)] if m]
+        out[name[4:] or "_default"] = {
+            "variant": name[4:], "latest": max(eps) if eps else None, "n": len(eps)}
+    return out
+
+
+@app.get("/api/runs")
+def route_api_runs():
+    """All runs{VARIANT} dirs + latest epoch — watch every version at once.
+    Then fetch a version's images via /img/<name>?variant=_v3 (same for /data)."""
+    return JSONResponse(content=_list_variants(), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/themes")
