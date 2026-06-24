@@ -1,4 +1,4 @@
-torch>=2.1
+torch>=2.12.1
 numpy
 segno
 tqdm
