@@ -90,7 +90,9 @@ def export_version(V):
 
 
 themes = [{"name": k, "label": LABELS.get(k, k),
-           "dark": v["qr_dark"], "light": v["qr_light"]}
+           "qr_dark": v["qr_dark"], "qr_light": v["qr_light"],
+           "trunk": v["trunk"], "leaf": v["leaf"],
+           "flower": v.get("flower", [])}
           for k, v in THEMES.items()]
 
 versions = {}
