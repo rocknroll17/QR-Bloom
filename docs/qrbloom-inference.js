@@ -20,10 +20,14 @@
 import qrcode from 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/+esm';
 import { makeQRBloom } from './qrbloom-model.js';
 
-// ?weights=<base> overrides the weight host — e.g. ?weights=./assets to test
-// a local export served next to the page, before it is uploaded to HF.
-const HF_BASE = new URLSearchParams(location.search).get('weights')
-  || 'https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/tfjs';
+// ?weights=<path> overrides the weight host for local testing — e.g.
+// ?weights=./assets to run an export served next to the page. Same-origin
+// relative paths only: accepting a full URL here would let a crafted link
+// make this page fetch and render arbitrary third-party weights.
+const _weightsParam = new URLSearchParams(location.search).get('weights');
+const HF_BASE = (_weightsParam && /^\.?\/(?!\/)/.test(_weightsParam))
+  ? _weightsParam
+  : 'https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/tfjs';
 const MANIFEST_URL = `${HF_BASE}/manifest.json`;
 
 const T_TOTAL    = 500;        // Diffusion.T
