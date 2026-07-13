@@ -18,7 +18,7 @@
 // static hosting works.
 
 import qrcode from 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/+esm';
-import { makeQRBloom } from './qrbloom-model.js';
+import { makeQRBloom } from './qrbloom-model.js?v=2';
 
 // Weight host resolution, in priority order:
 //   1. ?weights=<same-origin path> — explicit override. Relative paths only:

@@ -32,7 +32,7 @@
 // hash (gzip + base64url) — no model, no inference, no host-page dependency.
 // Reuses the shared Viewer so the embed has the same tree/QR modes (the QR view
 // blends each column to its base colour, so the top-down silhouette scans).
-import { Viewer } from './qrbloom-viewer.js';
+import { Viewer } from './qrbloom-viewer.js?v=2';
 
 async function gunzipB64(b64) {
   const bin = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));

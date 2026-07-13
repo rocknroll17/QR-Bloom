@@ -228,9 +228,9 @@
 }}
 </script>
 <script type="module">
-import { Viewer } from './qrbloom-viewer.js';
+import { Viewer } from './qrbloom-viewer.js?v=2';
 import { ensureManifest, downloadModel, generate, getDownloadState, weightsSource }
-  from './qrbloom-inference.js';
+  from './qrbloom-inference.js?v=2';
 
 // Single shared viewer — same rendering code as the home-hosted gallery.
 const viewer = new Viewer(document.body);
