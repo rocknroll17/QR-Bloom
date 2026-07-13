@@ -98,7 +98,6 @@ themes = [{"name": k, "label": LABELS.get(k, k),
 attrs = {k: {str(v): attr_stats(k, v) for v in VERSIONS} for k in THEMES}
 
 top = {"format_version": 3, "model_type": "qrbloom-dit3d-tfjs",
-       "epoch": int(ck.get("epoch", 0)),
        "weights": "weights_all.bin", "params": "manifest_all.json",
        "bytes": len(buf), "sha256": hashlib.sha256(bytes(buf)).hexdigest(),
        "trained_versions": VERSIONS,
