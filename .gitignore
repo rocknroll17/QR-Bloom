@@ -273,3 +273,6 @@ SCRATCH.md
 .vscode/
 *.swp
 *.swo
+
+# Exported browser weights (uploaded to HF, not tracked)
+docs/assets/
