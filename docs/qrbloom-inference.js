@@ -3,26 +3,45 @@
 // Mirrors the home-hosted gallery.py pipeline:
 //   pick_version_for_text(text) → segno-compatible smallest standard QR clamped
 //   into the trained-version range from manifest.json. Encode the QR matrix,
-//   pad it to the grid, run v-prediction diffusion sampling against the
-//   per-version UNet, and post-process the (occ, rgb) output into the same
-//   `[x, y, z, scale, color]` cell list the viewer expects.
+//   pad it to the grid, run v-prediction diffusion sampling, and post-process
+//   the (occ, rgb) output into the same `[x, y, z, scale, color]` cell list
+//   the viewer expects.
 //
-// Weights live on Hugging Face. Manifest at the same path supplies grid sizes
-// and theme metadata. First page load kicks off background downloads of every
-// trained version; per-version inference waits only for the one it needs.
+// ONE model serves every trained QR version — the version is passed to the
+// net at runtime (micro-conditioning), so a single weights download covers
+// the whole trained range. Weights live on Hugging Face; the manifest at the
+// same path supplies grid sizes and theme metadata.
 //
-// ENGINE: tf.js on the WebGPU backend. (ORT's WebGPU EP supports 2-D conv
-// only — the UNet's 3-D ConvTranspose fails — and ORT-WASM is CPU-slow.) The
-// model (qrbloom-model.js) runs every 3-D conv as a stack of 2-D convs over
-// depth slices: numerically identical to the PyTorch model (max|diff| 3.8e-4)
-// but on tf.js's fast conv2d kernels (~8x faster than its conv3d). WebGPU
-// needs no COOP/COEP, so plain static hosting works.
+// ENGINE: tf.js on the WebGPU backend. The DiT backbone is matmul/attention
+// only (qrbloom-model.js) — no 3-D convs, so every GPU tensor stays rank ≤ 4
+// and runs on tf.js's fastest kernels. WebGPU needs no COOP/COEP, so plain
+// static hosting works.
 
 import qrcode from 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/+esm';
 import { makeQRBloom } from './qrbloom-model.js';
 
-const HF_BASE = 'https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/tfjs';
-const MANIFEST_URL = `${HF_BASE}/manifest.json`;
+// Weight host resolution, in priority order:
+//   1. ?weights=<same-origin path> — explicit override. Relative paths only:
+//      accepting a full URL would let a crafted link make this page fetch
+//      and render arbitrary third-party weights.
+//   2. ./assets/ served next to the page — the local dev loop
+//      (scripts/export_for_tfjs.py writes there; the folder is gitignored,
+//      so the deployed Pages site never has it and falls through to HF).
+//   3. The Hugging Face weight host — production.
+const HF_HOST = 'https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/tfjs';
+let _base = null;
+async function weightBase() {
+  if (_base) return _base;
+  const p = new URLSearchParams(location.search).get('weights');
+  if (p && /^\.?\/(?!\/)/.test(p)) return (_base = p);
+  try {
+    const r = await fetch('./assets/manifest.json', { method: 'HEAD', cache: 'no-cache' });
+    if (r.ok) return (_base = './assets');
+  } catch { /* no local assets — fall through to HF */ }
+  return (_base = HF_HOST);
+}
+// 'local' when serving weights from this origin, 'hf' for the production host.
+export const weightsSource = () => (_base && _base !== HF_HOST ? 'local' : 'hf');
 
 const T_TOTAL    = 500;        // Diffusion.T
 const STEPS      = 16;         // diffusion steps — tuned for browser (quality holds well below the gallery's 100)
@@ -64,10 +83,12 @@ function ensureBackend() {
   return _backendPromise;
 }
 
-// --- manifest + downloads --------------------------------------------------
+// --- manifest + download -----------------------------------------------------
 
 let _manifest = null;
-const _versionState = new Map();  // version → { phase, bytes, total, fetchPromise, buf, params, net }
+const _model = { phase: 'pending', bytes: 0, total: 0,
+                 fetchPromise: null, netPromise: null,
+                 buf: null, params: null, net: null };
 
 // Weights are persisted in the Cache API keyed by their content hash (sha256
 // from the manifest), so they download exactly once and survive reloads —
@@ -77,18 +98,14 @@ const _versionState = new Map();  // version → { phase, bytes, total, fetchPro
 // old revisions are pruned below.
 const _CACHE_NAME = 'qrbloom-weights-v1';
 async function _openCache() { try { return await caches.open(_CACHE_NAME); } catch { return null; } }
-const _verSha = (meta) => meta.sha256 || String(meta.bytes); // fallback if manifest lacks a hash
-const _wKey = (v, sha) => `qrbloom-cache/weights-v${v}-${sha}`;
-const _pKey = (v, sha) => `qrbloom-cache/params-v${v}-${sha}`;
+const _sha = () => _manifest.sha256 || String(_manifest.bytes);
+const _wKey = (sha) => `qrbloom-cache/weights-all-${sha}`;
+const _pKey = (sha) => `qrbloom-cache/params-all-${sha}`;
 
 async function _pruneCache() {
   const cache = await _openCache();
   if (!cache) return;
-  const valid = new Set();
-  for (const v of _manifest.trained_versions) {
-    const sha = _verSha(_manifest.versions[String(v)]);
-    valid.add(_wKey(v, sha)); valid.add(_pKey(v, sha));
-  }
+  const valid = new Set([_wKey(_sha()), _pKey(_sha())]);
   try {
     for (const req of await cache.keys()) {
       const tail = new URL(req.url).pathname.replace(/^\//, '');
@@ -99,26 +116,18 @@ async function _pruneCache() {
 
 export async function ensureManifest() {
   if (_manifest) return _manifest;
+  const base = await weightBase();
   // Fetch fresh (revalidate) so a re-uploaded model is picked up immediately.
-  const r = await fetch(MANIFEST_URL, { cache: 'no-cache' });
+  const r = await fetch(`${base}/manifest.json`, { cache: 'no-cache' });
   if (!r.ok) throw new Error(`manifest fetch ${r.status}`);
   _manifest = await r.json();
-  for (const v of _manifest.trained_versions) {
-    _versionState.set(v, {
-      phase: 'pending', bytes: 0, total: _manifest.versions[String(v)].bytes,
-      fetchPromise: null, buf: null, params: null, net: null,
-    });
-  }
+  _model.total = _manifest.bytes;
   await _pruneCache();
   return _manifest;
 }
 
 export function getDownloadState() {
-  const out = {};
-  for (const [v, s] of _versionState) {
-    out[v] = { phase: s.phase, bytes: s.bytes, total: s.total };
-  }
-  return out;
+  return { phase: _model.phase, bytes: _model.bytes, total: _model.total };
 }
 
 // HF's Xet CDN intermittently returns a transient 403 on browser fetches, so
@@ -145,123 +154,99 @@ async function _fetchOk(url, opts) {
 }
 
 // Phase 1: download bytes only (network — no GPU). Building the tf.js net and
-// the WebGPU warmup are deferred to first use (buildVersionNet) so streaming
-// every version on page load doesn't stutter the UI with GPU work.
-function fetchVersionBytes(version, onProgress) {
-  const st = _versionState.get(version);
-  if (!st) throw new Error(`unknown version ${version}`);
-  if (st.buf || st.net) return Promise.resolve();
-  if (st.fetchPromise) return st.fetchPromise;
-  st.fetchPromise = (async () => {
-    st.phase = 'downloading';
-    const meta = _manifest.versions[String(version)];
-    const sha = _verSha(meta);
+// the WebGPU warmup are deferred to first use (buildNet) so the page-load
+// download doesn't stutter the UI with GPU work.
+function fetchModelBytes(onProgress) {
+  if (_model.buf || _model.net) return Promise.resolve();
+  if (_model.fetchPromise) return _model.fetchPromise;
+  _model.fetchPromise = (async () => {
+    _model.phase = 'downloading';
+    const sha = _sha();
     const cache = await _openCache();
     // Network downloads use cache:'no-store' (never touch the HTTP cache, which
     // would otherwise pin a transient 403); retries re-fetch fresh. Persistence
     // is handled by the Cache API below, keyed by content hash.
-    const params = await (cache && cache.match(_pKey(version, sha)).catch(() => null));
-    if (params) st.params = await params.json();
+    const params = await (cache && cache.match(_pKey(sha)).catch(() => null));
+    if (params) _model.params = await params.json();
     else {
-      st.params = await _withRetry(
-        () => _fetchOk(`${HF_BASE}/${meta.params}`, { cache: 'no-store' }).then((r) => r.json()),
-        `v${version} params`);
-      if (cache) cache.put(_pKey(version, sha),
-        new Response(JSON.stringify(st.params), { headers: { 'content-type': 'application/json' } })).catch(() => {});
+      _model.params = await _withRetry(
+        () => _fetchOk(`${_base}/${_manifest.params}`, { cache: 'no-store' }).then((r) => r.json()),
+        'params');
+      if (cache) cache.put(_pKey(sha),
+        new Response(JSON.stringify(_model.params), { headers: { 'content-type': 'application/json' } })).catch(() => {});
     }
 
-    const hit = await (cache && cache.match(_wKey(version, sha)).catch(() => null));
+    const hit = await (cache && cache.match(_wKey(sha)).catch(() => null));
     if (hit) {                                   // cache hit — no network, no re-download
-      st.bytes = meta.bytes;
-      if (onProgress) onProgress({ version, downloadedBytes: meta.bytes, totalBytes: meta.bytes });
-      st.buf = new Uint8Array(await hit.arrayBuffer());
+      _model.bytes = _manifest.bytes;
+      if (onProgress) onProgress({ downloadedBytes: _model.bytes, totalBytes: _model.total });
+      _model.buf = new Uint8Array(await hit.arrayBuffer());
     } else {
       // the whole stream lives inside the retry, so a mid-download failure restarts it
-      st.buf = await _withRetry(async () => {
-        const resp = await _fetchOk(`${HF_BASE}/${meta.weights}`, { cache: 'no-store' });
+      _model.buf = await _withRetry(async () => {
+        const resp = await _fetchOk(`${_base}/${_manifest.weights}`, { cache: 'no-store' });
         const reader = resp.body.getReader();
-        const total = meta.bytes;
+        const total = _manifest.bytes;
         const buf = new Uint8Array(total);
-        let offset = 0; st.bytes = 0;
+        let offset = 0; _model.bytes = 0;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           buf.set(value, offset);
           offset += value.byteLength;
-          st.bytes = offset;
-          if (onProgress) onProgress({ version, downloadedBytes: offset, totalBytes: total });
+          _model.bytes = offset;
+          if (onProgress) onProgress({ downloadedBytes: offset, totalBytes: total });
         }
         return buf;
-      }, `v${version} weights`);
-      if (cache) cache.put(_wKey(version, sha),
-        new Response(st.buf, { headers: { 'content-type': 'application/octet-stream' } })).catch(() => {});
+      }, 'weights');
+      if (cache) cache.put(_wKey(sha),
+        new Response(_model.buf, { headers: { 'content-type': 'application/octet-stream' } })).catch(() => {});
     }
-    st.phase = 'downloaded';
+    _model.phase = 'downloaded';
   })().catch((e) => {
-    st.phase = 'error';
-    st.fetchPromise = null;   // clear so a later call (e.g. Generate) can retry from scratch
+    _model.phase = 'error';
+    _model.fetchPromise = null;   // clear so a later call (e.g. Generate) can retry from scratch
     throw e;
   });
-  return st.fetchPromise;
+  return _model.fetchPromise;
 }
 
-// Phase 2: build the tf.js net + warmup (GPU). Lazy — only when a version is
-// actually used for generation.
-let _buildChain = Promise.resolve();   // serialize builds so warmups don't pile on the GPU at once
-async function buildVersionNet(version) {
-  const st = _versionState.get(version);
-  if (st.net) return st.net;
-  await fetchVersionBytes(version);
-  st.netPromise = st.netPromise || (async () => {
+// Phase 2: build the tf.js net + warmup (GPU). Lazy — first generation only.
+// Warmup runs on the smallest trained grid; larger grids compile their
+// pipelines on first use.
+async function buildNet() {
+  if (_model.net) return _model.net;
+  await fetchModelBytes();
+  _model.netPromise = _model.netPromise || (async () => {
     await ensureBackend();
-    // serialize against any other in-flight build
-    const run = _buildChain.then(async () => {
-      st.phase = 'creating-session';
-      const net = makeQRBloom(tf, st.params, st.buf.buffer);
-      const [gx, , gz] = st.params.grid;
-      const o = net.forward(tf.zeros([1,gx,gx,gz,4]), tf.zeros([1,gx,gx,gz,1]), 0, 0, [0.5,0.5,0.5], 1.0);
-      await o.data(); o.dispose();
-      st.net = net; st.buf = null;   // free the raw bytes once on the GPU
-      st.phase = 'ready';
-      return net;
-    });
-    _buildChain = run.catch(() => {});
-    return run;
-  })().catch(e => { st.phase = 'error'; throw e; });
-  return st.netPromise;
+    _model.phase = 'creating-session';
+    const net = makeQRBloom(tf, _model.params, _model.buf.buffer);
+    const vMin = Math.min(..._manifest.trained_versions);
+    const g = _manifest.versions[String(vMin)];
+    await net.forward(new Float32Array(4 * g.grid_xy * g.grid_xy * g.grid_z),
+                      new Float32Array(g.grid_xy * g.grid_xy * g.grid_z),
+                      0, 0, [0.5, 0.5, 0.5], 1.0, vMin);
+    _model.net = net; _model.buf = null;   // free the raw bytes once on the GPU
+    _model.phase = 'ready';
+    return net;
+  })().catch(e => { _model.phase = 'error'; throw e; });
+  return _model.netPromise;
 }
 
-export async function downloadAllVersions(onProgress) {
-  const m = await ensureManifest();
-  const versions = m.trained_versions.slice();
-  let ready = 0;
-  const total = versions.length;
-  const downloads = versions.map(v => fetchVersionBytes(v, p => {
-    if (onProgress) onProgress({
-      ready, total, current: v,
-      downloadedBytes: p.downloadedBytes, totalBytes: p.totalBytes,
-    });
-  }).then(() => {
-    ready += 1;
-    if (onProgress) onProgress({
-      ready, total, current: null, downloadedBytes: 0, totalBytes: 0,
-    });
-  }));
-  await Promise.allSettled(downloads);
+export async function downloadModel(onProgress) {
+  await ensureManifest();
+  try { await fetchModelBytes(onProgress); } catch { /* surfaced via phase */ }
 }
 
-async function waitForVersion(version, onWait) {
-  const st = _versionState.get(version);
-  if (!st) throw new Error(`version ${version} not in manifest`);
-  if (st.net) return st.net;
-  // make sure bytes are downloading, surface progress, then build the net
-  fetchVersionBytes(version).catch(() => {});
-  while (!st.buf && !st.net) {
-    if (st.phase === 'error') throw new Error(`v${version} download failed`);
-    if (onWait) onWait({ version, downloadedBytes: st.bytes, totalBytes: st.total });
+async function waitForModel(onWait) {
+  if (_model.net) return _model.net;
+  fetchModelBytes().catch(() => {});
+  while (!_model.buf && !_model.net) {
+    if (_model.phase === 'error') throw new Error('model download failed');
+    if (onWait) onWait({ downloadedBytes: _model.bytes, totalBytes: _model.total });
     await new Promise(r => setTimeout(r, 250));
   }
-  return buildVersionNet(version);
+  return buildNet();
 }
 
 // --- QR encoding -----------------------------------------------------------
@@ -305,7 +290,7 @@ function encodeQR(text, trainedVersions) {
 // --- cosine β schedule + per-step constants --------------------------------
 
 function buildSchedule() {
-  // Matches qrbloom/diffusion.py:cosine_beta_schedule (T=500, s=0.008).
+  // Matches qrbloom/model.py:cosine_beta_schedule (T=500, s=0.008).
   const T = T_TOTAL;
   const acp = new Float32Array(T);
   const sqrt_acp = new Float32Array(T);
@@ -343,24 +328,9 @@ function fillNormal(arr) {
   }
 }
 
-// --- model forward: NCHW Float32Array -> v_pred NCHW Float32Array -----------
-// The diffusion loop below keeps the exact NCHW layout / math from the ONNX
-// path. The tf.js model is NDHWC, so transpose in and out around net.forward.
-
-async function forwardNCHW(net, xNCHW, D, H, W, t, condNDHWC, themeIdx) {
-  const vT = tf.tidy(() => {
-    const xND = tf.transpose(tf.tensor(xNCHW, [1, X0_CH, D, H, W]), [0, 2, 3, 4, 1]); // NDHWC
-    const v = net.forward(xND, condNDHWC, t, themeIdx, [0.5, 0.5, 0.5], 1.0);          // NDHWC
-    return tf.transpose(v, [0, 4, 1, 2, 3]);                                           // NCHW
-  });
-  const data = await vT.data();
-  vT.dispose();
-  return data;
-}
-
 // --- model_generate-equivalent sampling loop -------------------------------
 
-async function sampleVoxels(net, version, themeIdx, qr, onPhase) {
+async function sampleVoxels(net, version, themeIdx, qr, attr, onPhase) {
   const meta = _manifest.versions[String(version)];
   const D = meta.grid_xy;
   const H = meta.grid_xy;
@@ -380,8 +350,6 @@ async function sampleVoxels(net, version, themeIdx, qr, onPhase) {
       }
     }
   }
-  const condNDHWC = tf.tensor(condArr, [1, D, H, W, 1]);   // built once, reused every step
-
   let x = new Float32Array(voxN);
   fillNormal(x);
 
@@ -391,7 +359,7 @@ async function sampleVoxels(net, version, themeIdx, qr, onPhase) {
 
   for (let idx = 0; idx < steps; idx++) {
     const t = seq[idx];
-    const vPred = await forwardNCHW(net, x, D, H, W, t, condNDHWC, themeIdx);  // Float32Array NCHW
+    const vPred = await net.forward(x, condArr, t, themeIdx, attr, 1.0, version);  // Float32Array NCHW
     const a = SCHED.sqrt_acp[t];
     const b = SCHED.sqrt_one_minus_acp[t];
     // x0_pred = a*x - b*v, clamp(-1,1); eps_pred = b*x + a*v
@@ -422,7 +390,6 @@ async function sampleVoxels(net, version, themeIdx, qr, onPhase) {
       onPhase('sampling', { version, step: idx + 1, total: steps });
     }
   }
-  condNDHWC.dispose();
 
   // Enforce footprint: outside QR mask, set to -1 (will be rejected by occ > 0).
   for (let i = 0; i < D; i++) {
@@ -500,10 +467,13 @@ export async function generate({ url, theme, onPhase }) {
   const themeIdx = m.themes.findIndex(t => t.name === themeMeta.name);
   if (themeIdx < 0) throw new Error(`unknown theme ${theme}`);
   const qr = encodeQR(url, m.trained_versions);
-  const net = await waitForVersion(qr.version, info => {
+  const net = await waitForModel(info => {
     if (onPhase) onPhase('waiting-download', info);
   });
-  const { x0, D, H, W } = await sampleVoxels(net, qr.version, themeIdx, qr, onPhase);
+  // Per-species mean training attributes for this version — a "typical" tree.
+  const attr = (m.attrs && m.attrs[themeMeta.name] && m.attrs[themeMeta.name][String(qr.version)])
+    || [0.5, 0.5, 0.5];
+  const { x0, D, H, W } = await sampleVoxels(net, qr.version, themeIdx, qr, attr, onPhase);
   const cells = buildCells(x0, D, H, W, qr, themeMeta);
   return { cells, version: qr.version, theme: themeMeta.name, url };
 }

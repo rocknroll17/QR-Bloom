@@ -229,7 +229,7 @@
 </script>
 <script type="module">
 import { Viewer } from './qrbloom-viewer.js';
-import { ensureManifest, downloadAllVersions, generate, getDownloadState }
+import { ensureManifest, downloadModel, generate, getDownloadState, weightsSource }
   from './qrbloom-inference.js';
 
 // Single shared viewer — same rendering code as the home-hosted gallery.
@@ -270,7 +270,7 @@ function setStatus(label, pct) {
 // Generate stays disabled until at least one model is actually downloaded — a
 // transient CDN failure must never leave a clickable button over a fake "Ready".
 urlBtn.disabled = true;
-setStatus('Loading models');
+setStatus('Loading model');
 
 // Themes come from the manifest hosted alongside the weights so the UI can
 // never drift from what the trained model knows about.
@@ -280,20 +280,17 @@ ensureManifest().then(m => {
     o.value = th.name; o.textContent = th.label;
     urlTheme.appendChild(o);
   }
-  // Kick off background downloads for every trained version after the page
-  // is interactive. Bottom-right shows one combined progress bar.
-  downloadAllVersions(() => {
-    let dl = 0, tot = 0;
+  // Kick off the model download after the page is interactive; one weights
+  // file covers every trained QR version.
+  downloadModel(() => {
     const st = getDownloadState();
-    for (const v in st) { dl += st[v].bytes; tot += st[v].total; }
-    setStatus('Downloading models', tot ? (dl / tot) * 100 : 0);
+    setStatus('Downloading model', st.total ? (st.bytes / st.total) * 100 : 0);
   }).then(() => {
-    // Gate on actual readiness — only enable Generate if a model really loaded.
-    const all = Object.values(getDownloadState());
-    const ready = all.filter(s => s.phase === 'downloaded' || s.phase === 'ready').length;
-    if (ready > 0) {
+    // Gate on actual readiness — only enable Generate if the model really loaded.
+    const st = getDownloadState();
+    if (st.phase === 'downloaded' || st.phase === 'ready') {
       urlBtn.disabled = false;
-      setStatus(ready === all.length ? 'Ready' : `Ready · ${ready}/${all.length} models`);
+      setStatus(weightsSource() === 'local' ? 'Ready · local weights' : 'Ready');
     } else {
       urlBtn.disabled = true;
       setStatus('Model load failed — reload to retry');
