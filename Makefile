@@ -108,11 +108,11 @@ export: ## Export EMA weights + manifest for the browser demo.
 	@$(PY) scripts/export_for_tfjs.py
 
 demo: ## Serve the browser demo on :$(DEMO_PORT) (auto-uses docs/assets weights).
-	@nohup python3 scripts/demo_server.py --port $(DEMO_PORT) > /tmp/qrbloom-demo.log 2>&1 &
+	@nohup python3 -m http.server $(DEMO_PORT) -d docs --bind 0.0.0.0 > /tmp/qrbloom-demo.log 2>&1 &
 	@sleep 1 && echo "demo → http://localhost:$(DEMO_PORT)/"
 
 stop-demo: ## Kill the demo server.
-	@pkill -KILL -f "demo_server.py --port $(DEMO_PORT)" 2>/dev/null || true
+	@pkill -KILL -f "http.server $(DEMO_PORT)" 2>/dev/null || true
 	@echo "demo stopped"
 
 # ── Gallery ──────────────────────────────────────────────────────────────
