@@ -29,7 +29,7 @@ import torch
 
 from qrbloom.model import DiT3D, Diffusion, X0_CH, N_THEMES
 from qrbloom.qr import grid_xy_for_version, grid_z_for_version
-from qrbloom.treegen import LABELS, THEMES, attr_means
+from qrbloom.treegen import LABELS, THEMES, attr_stats
 
 OUT = "docs/assets"
 os.makedirs(OUT, exist_ok=True)
@@ -92,9 +92,10 @@ themes = [{"name": k, "label": LABELS.get(k, k),
            "flower": v.get("flower", [])}
           for k, v in THEMES.items()]
 
-# Per-(theme, version) mean training attributes — the browser conditions
-# generation on these so every species gets its "typical" proportions.
-attrs = {k: {str(v): attr_means(k, v) for v in VERSIONS} for k in THEMES}
+# Per-(theme, version) training attribute stats ({mean, std}) — the browser
+# samples its conditioning from this distribution, so every species gets
+# varied but in-distribution proportions.
+attrs = {k: {str(v): attr_stats(k, v) for v in VERSIONS} for k in THEMES}
 
 top = {"format_version": 3, "model_type": "qrbloom-dit3d-tfjs",
        "weights": "weights_all.bin", "params": "manifest_all.json",

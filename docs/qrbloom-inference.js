@@ -328,6 +328,11 @@ function fillNormal(arr) {
   }
 }
 
+function randn() {
+  const u = Math.max(1e-12, Math.random());
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * Math.random());
+}
+
 // --- model_generate-equivalent sampling loop -------------------------------
 
 async function sampleVoxels(net, version, themeIdx, qr, attr, onPhase) {
@@ -470,9 +475,20 @@ export async function generate({ url, theme, onPhase }) {
   const net = await waitForModel(info => {
     if (onPhase) onPhase('waiting-download', info);
   });
-  // Per-species mean training attributes for this version — a "typical" tree.
-  const attr = (m.attrs && m.attrs[themeMeta.name] && m.attrs[themeMeta.name][String(qr.version)])
-    || [0.5, 0.5, 0.5];
+  // Attribute conditioning: sample from the species' training distribution
+  // (manifest mean ± std, clamped to ±2σ and [0,1]), so repeated generations
+  // vary in proportions while staying in-distribution — values outside the
+  // species' range produce floating-voxel artifacts.
+  const stats = m.attrs && m.attrs[themeMeta.name] && m.attrs[themeMeta.name][String(qr.version)];
+  let attr = [0.5, 0.5, 0.5];
+  if (Array.isArray(stats)) {
+    attr = stats;                                  // mean-only manifest
+  } else if (stats) {
+    attr = stats.mean.map((mu, i) => {
+      const z = Math.max(-2, Math.min(2, randn()));
+      return Math.min(1, Math.max(0, mu + z * stats.std[i]));
+    });
+  }
   const { x0, D, H, W } = await sampleVoxels(net, qr.version, themeIdx, qr, attr, onPhase);
   const cells = buildCells(x0, D, H, W, qr, themeMeta);
   return { cells, version: qr.version, theme: themeMeta.name, url };

@@ -630,31 +630,39 @@ def tree_attributes(voxels, qr_side: int | None = None):
     return [min(1.0, max(0.0, a)) for a in (height, fullness, spread)]
 
 
-_ATTR_MEAN_CACHE: dict = {}
+_ATTR_STATS_CACHE: dict = {}
 
 
-def attr_means(theme: str, version: int, n: int = 32, seed: int = 20260713):
-    """Mean [height, fullness, spread] of augmented training trees for
-    (theme, version).
+def attr_stats(theme: str, version: int, n: int = 32, seed: int = 20260713):
+    """Mean/std of [height, fullness, spread] over augmented training trees
+    for (theme, version), as {"mean": [...], "std": [...]}.
 
-    This is the in-distribution conditioning for a "typical" tree of that
-    species at that QR version — attribute distributions differ strongly per
-    species (e.g. palm height ≈ 1.0 vs acacia ≈ 0.5 at v4), so a global
-    mid-value like 0.5 sits outside most species' training range and skews
-    generation. Sampled once per (theme, version) per process and cached.
+    The mean is the in-distribution conditioning for a "typical" tree of
+    that species at that QR version — attribute distributions differ
+    strongly per species (e.g. palm height ≈ 0.64 vs acacia ≈ 0.42 at v4),
+    so a global mid-value like 0.5 sits outside most species' training
+    range and skews generation. The std lets samplers draw varied but
+    still in-distribution attributes. Computed once per (theme, version)
+    per process and cached.
     """
     key = (theme, int(version))
-    hit = _ATTR_MEAN_CACHE.get(key)
+    hit = _ATTR_STATS_CACHE.get(key)
     if hit is not None:
         return hit
     from qrbloom.qr import random_qr_core
     rng = random.Random(seed + version * 101)
     npr = np.random.default_rng(seed + version * 101)
-    acc = np.zeros(3)
-    for _ in range(n):
+    samples = np.zeros((n, 3))
+    for i in range(n):
         core = random_qr_core(npr, version=version)
         vox = _gen(core.tolist(), theme, rng, augment=True)
-        acc += np.array(tree_attributes(vox, qr_side=core.shape[0]))
-    out = [float(round(x, 4)) for x in (acc / n)]
-    _ATTR_MEAN_CACHE[key] = out
+        samples[i] = tree_attributes(vox, qr_side=core.shape[0])
+    out = {"mean": [float(round(x, 4)) for x in samples.mean(axis=0)],
+           "std": [float(round(x, 4)) for x in samples.std(axis=0)]}
+    _ATTR_STATS_CACHE[key] = out
     return out
+
+
+def attr_means(theme: str, version: int) -> list[float]:
+    """Mean training attributes for (theme, version) — see attr_stats."""
+    return attr_stats(theme, version)["mean"]
