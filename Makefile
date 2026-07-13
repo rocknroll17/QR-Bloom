@@ -20,6 +20,9 @@
 #
 #   make export                  Export EMA weights for the browser demo
 #                                into docs/assets/.
+#   make demo                    Serve docs/ on :8080 — the page auto-detects
+#                                docs/assets/ and runs the local weights.
+#   make stop-demo               Kill the demo server.
 #
 #   make gallery                 Start the FastAPI viewer (CPU inference,
 #                                safe to run alongside training).
@@ -47,7 +50,8 @@
 PY      ?= python3
 TS      := $(shell date +%Y%m%d_%H%M%S)
 BAK_DIR := backups/$(TS)
-PORT    ?= 8000
+PORT      ?= 8000
+DEMO_PORT ?= 8080
 
 # Training config — BATCH is sized for ~8GB VRAM at the largest grid (v5).
 EPOCHS         ?= 300
@@ -67,7 +71,7 @@ TRAIN_ENV := CUDA_DEVICE_ORDER=PCI_BUS_ID \
              VAL_SIZE=$(VAL_SIZE) SAMPLE_STEPS=$(SAMPLE_STEPS) WORKERS=$(WORKERS) \
              MONT_VERSION=$(MONT_VERSION)
 
-.PHONY: help train stop status logs export \
+.PHONY: help train stop status logs export demo stop-demo \
         gallery gallery-gpu stop-gallery \
         clean-checkpoints clean-runs
 
@@ -98,10 +102,18 @@ status: ## GPU usage + latest val metrics.
 logs: ## Follow the training log.
 	@tail -f runs_all/train.log
 
-# ── Export ───────────────────────────────────────────────────────────────
+# ── Export / demo ────────────────────────────────────────────────────────
 
 export: ## Export EMA weights + manifest for the browser demo.
 	@$(PY) scripts/export_for_tfjs.py
+
+demo: ## Serve the browser demo on :$(DEMO_PORT) (auto-uses docs/assets weights).
+	@nohup python3 -m http.server $(DEMO_PORT) -d docs --bind 0.0.0.0 > /tmp/qrbloom-demo.log 2>&1 &
+	@sleep 1 && echo "demo → http://localhost:$(DEMO_PORT)/"
+
+stop-demo: ## Kill the demo server.
+	@pkill -KILL -f "http.server $(DEMO_PORT)" 2>/dev/null || true
+	@echo "demo stopped"
 
 # ── Gallery ──────────────────────────────────────────────────────────────
 

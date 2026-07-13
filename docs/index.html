@@ -229,7 +229,7 @@
 </script>
 <script type="module">
 import { Viewer } from './qrbloom-viewer.js';
-import { ensureManifest, downloadModel, generate, getDownloadState }
+import { ensureManifest, downloadModel, generate, getDownloadState, weightsSource }
   from './qrbloom-inference.js';
 
 // Single shared viewer — same rendering code as the home-hosted gallery.
@@ -290,7 +290,7 @@ ensureManifest().then(m => {
     const st = getDownloadState();
     if (st.phase === 'downloaded' || st.phase === 'ready') {
       urlBtn.disabled = false;
-      setStatus('Ready');
+      setStatus(weightsSource() === 'local' ? 'Ready · local weights' : 'Ready');
     } else {
       urlBtn.disabled = true;
       setStatus('Model load failed — reload to retry');

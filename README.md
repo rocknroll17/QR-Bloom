@@ -165,6 +165,22 @@ generated trees in 3D and hot-reloads as new checkpoints appear during
 training. Tilt the camera toward top-down and the tree's block colors resolve
 into the scannable QR code.
 
+### Local browser demo (WebGPU)
+
+The same static page that runs on GitHub Pages can serve a locally trained
+model — no upload needed:
+
+```bash
+make export          # write EMA weights + manifest into docs/assets/
+make demo            # serve docs/ on :8080
+```
+
+Open `http://localhost:8080` (localhost is required for WebGPU). The page
+auto-detects `docs/assets/` and shows "Ready · local weights"; without that
+folder (e.g. the deployed Pages site — it is gitignored) it loads the
+published weights from Hugging Face. Re-run `make export` after training
+improves and refresh the page to pick the new model up.
+
 ## Docker
 
 A prebuilt image is published to GitHub Container Registry on every push to `main`.

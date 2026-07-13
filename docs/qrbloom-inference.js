@@ -20,15 +20,28 @@
 import qrcode from 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/+esm';
 import { makeQRBloom } from './qrbloom-model.js';
 
-// ?weights=<path> overrides the weight host for local testing — e.g.
-// ?weights=./assets to run an export served next to the page. Same-origin
-// relative paths only: accepting a full URL here would let a crafted link
-// make this page fetch and render arbitrary third-party weights.
-const _weightsParam = new URLSearchParams(location.search).get('weights');
-const HF_BASE = (_weightsParam && /^\.?\/(?!\/)/.test(_weightsParam))
-  ? _weightsParam
-  : 'https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/tfjs';
-const MANIFEST_URL = `${HF_BASE}/manifest.json`;
+// Weight host resolution, in priority order:
+//   1. ?weights=<same-origin path> — explicit override. Relative paths only:
+//      accepting a full URL would let a crafted link make this page fetch
+//      and render arbitrary third-party weights.
+//   2. ./assets/ served next to the page — the local dev loop
+//      (scripts/export_for_tfjs.py writes there; the folder is gitignored,
+//      so the deployed Pages site never has it and falls through to HF).
+//   3. The Hugging Face weight host — production.
+const HF_HOST = 'https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/tfjs';
+let _base = null;
+async function weightBase() {
+  if (_base) return _base;
+  const p = new URLSearchParams(location.search).get('weights');
+  if (p && /^\.?\/(?!\/)/.test(p)) return (_base = p);
+  try {
+    const r = await fetch('./assets/manifest.json', { method: 'HEAD', cache: 'no-cache' });
+    if (r.ok) return (_base = './assets');
+  } catch { /* no local assets — fall through to HF */ }
+  return (_base = HF_HOST);
+}
+// 'local' when serving weights from this origin, 'hf' for the production host.
+export const weightsSource = () => (_base && _base !== HF_HOST ? 'local' : 'hf');
 
 const T_TOTAL    = 500;        // Diffusion.T
 const STEPS      = 16;         // diffusion steps — tuned for browser (quality holds well below the gallery's 100)
@@ -103,8 +116,9 @@ async function _pruneCache() {
 
 export async function ensureManifest() {
   if (_manifest) return _manifest;
+  const base = await weightBase();
   // Fetch fresh (revalidate) so a re-uploaded model is picked up immediately.
-  const r = await fetch(MANIFEST_URL, { cache: 'no-cache' });
+  const r = await fetch(`${base}/manifest.json`, { cache: 'no-cache' });
   if (!r.ok) throw new Error(`manifest fetch ${r.status}`);
   _manifest = await r.json();
   _model.total = _manifest.bytes;
@@ -156,7 +170,7 @@ function fetchModelBytes(onProgress) {
     if (params) _model.params = await params.json();
     else {
       _model.params = await _withRetry(
-        () => _fetchOk(`${HF_BASE}/${_manifest.params}`, { cache: 'no-store' }).then((r) => r.json()),
+        () => _fetchOk(`${_base}/${_manifest.params}`, { cache: 'no-store' }).then((r) => r.json()),
         'params');
       if (cache) cache.put(_pKey(sha),
         new Response(JSON.stringify(_model.params), { headers: { 'content-type': 'application/json' } })).catch(() => {});
@@ -170,7 +184,7 @@ function fetchModelBytes(onProgress) {
     } else {
       // the whole stream lives inside the retry, so a mid-download failure restarts it
       _model.buf = await _withRetry(async () => {
-        const resp = await _fetchOk(`${HF_BASE}/${_manifest.weights}`, { cache: 'no-store' });
+        const resp = await _fetchOk(`${_base}/${_manifest.weights}`, { cache: 'no-store' });
         const reader = resp.body.getReader();
         const total = _manifest.bytes;
         const buf = new Uint8Array(total);
