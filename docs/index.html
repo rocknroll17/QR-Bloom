@@ -290,7 +290,8 @@ ensureManifest().then(m => {
     const st = getDownloadState();
     if (st.phase === 'downloaded' || st.phase === 'ready') {
       urlBtn.disabled = false;
-      setStatus(weightsSource() === 'local' ? 'Ready · local weights' : 'Ready');
+      const ep = m.epoch ? ` · ep${m.epoch}` : '';
+      setStatus((weightsSource() === 'local' ? 'Ready · local weights' : 'Ready') + ep);
     } else {
       urlBtn.disabled = true;
       setStatus('Model load failed — reload to retry');
