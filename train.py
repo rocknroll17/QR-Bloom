@@ -550,8 +550,12 @@ def sample_montage(diff, ema, mont_batch, mont_version, ep, png_path, device,
     mont_gz = grid_z_for_version(mont_version)
     cond = qr.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, mont_gz).contiguous()
     theme = th.to(device)
-    # Use mid-range attributes [0.5, 0.5, 0.5] to visualize an average tree shape.
-    attr = torch.full((th.size(0), 3), 0.5, device=device)
+    # Per-species mean attributes — a "typical" tree of each species at this
+    # version. A global mid-value like 0.5 sits outside most species' attr
+    # distribution (palm height ≈ 1.0, maple fullness ≈ 0.2) and skews shapes.
+    from qrbloom.treegen import attr_means
+    attr = torch.tensor([attr_means(DS_THEMES[int(t)], mont_version)
+                         for t in th], dtype=torch.float32, device=device)
     # All montage samples share the same QR version so we pass a scalar-broadcast.
     ver = torch.full((th.size(0),), int(mont_version), device=device, dtype=torch.long)
     with torch.no_grad():
@@ -731,10 +735,13 @@ def main():
                 pass
         start_epoch = ck["epoch"] + 1
         hist = ck["hist"]
-        if hist and not RESET_BEST:
-            vals = [h.get("val_total") for h in hist if h.get("val_total") is not None]
-            if vals:
-                best_val = min(vals)
+        if not RESET_BEST:
+            if "best_val" in ck:
+                best_val = ck["best_val"]
+            elif hist:
+                vals = [h.get("val_total") for h in hist if h.get("val_total") is not None]
+                if vals:
+                    best_val = min(vals)
         log(f"[resume] epoch {ck['epoch']} -> start epoch {start_epoch}  best_val={best_val:.4f}")
     else:
         log("[init] no checkpoint found, training from scratch")
@@ -830,12 +837,16 @@ def main():
                 f"v_rgb={epoch_parts['v_rgb']:.4f} v_occ={epoch_parts['v_occ']:.4f}")
             log(f"  -> {png}  {epoch_json}")
 
-            state = {"model": base_model.state_dict(), "ema": ema.shadow,
-                     "opt": opt.state_dict(), "scaler": scaler.state_dict(),
-                     "epoch": ep, "hist": hist}
-            _safe_save(state, CKPT)
             if val_metrics["total"] < best_val:
                 best_val = val_metrics["total"]
+                new_best = True
+            else:
+                new_best = False
+            state = {"model": base_model.state_dict(), "ema": ema.shadow,
+                     "opt": opt.state_dict(), "scaler": scaler.state_dict(),
+                     "epoch": ep, "hist": hist, "best_val": best_val}
+            _safe_save(state, CKPT)
+            if new_best:
                 _safe_save(state, CKPT_BEST)
                 log(f"  new best val_total={best_val:.4f}")
         if IS_DIST:

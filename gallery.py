@@ -220,7 +220,12 @@ def model_generate(url: str, theme_name: str, steps: int = 100,
     cond = qr_t.float().unsqueeze(1).unsqueeze(-1).expand(
         -1, 1, gxy, gxy, gz).contiguous()
     th_t = torch.tensor([theme_idx], device=dev).long()
-    attr = torch.full((1, 3), 0.5, device=dev)
+    # Per-species mean attributes — the in-distribution conditioning for a
+    # typical tree of this species at this version (a global 0.5 sits outside
+    # most species' training attr range).
+    from qrbloom.treegen import attr_means
+    attr = torch.tensor([attr_means(theme_name, version)], device=dev,
+                        dtype=torch.float32)
     ver_t = torch.tensor([int(version)], device=dev, dtype=torch.long)
     with _model_locks.setdefault(version, threading.Lock()), torch.no_grad():
         x0 = ctx["diff"].sample(ctx["model"], cond, th_t, attr=attr, steps=steps,

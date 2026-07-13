@@ -312,7 +312,7 @@ function fillNormal(arr) {
 
 // --- model_generate-equivalent sampling loop -------------------------------
 
-async function sampleVoxels(net, version, themeIdx, qr, onPhase) {
+async function sampleVoxels(net, version, themeIdx, qr, attr, onPhase) {
   const meta = _manifest.versions[String(version)];
   const D = meta.grid_xy;
   const H = meta.grid_xy;
@@ -341,7 +341,7 @@ async function sampleVoxels(net, version, themeIdx, qr, onPhase) {
 
   for (let idx = 0; idx < steps; idx++) {
     const t = seq[idx];
-    const vPred = await net.forward(x, condArr, t, themeIdx, [0.5, 0.5, 0.5], 1.0, version);  // Float32Array NCHW
+    const vPred = await net.forward(x, condArr, t, themeIdx, attr, 1.0, version);  // Float32Array NCHW
     const a = SCHED.sqrt_acp[t];
     const b = SCHED.sqrt_one_minus_acp[t];
     // x0_pred = a*x - b*v, clamp(-1,1); eps_pred = b*x + a*v
@@ -452,7 +452,10 @@ export async function generate({ url, theme, onPhase }) {
   const net = await waitForModel(info => {
     if (onPhase) onPhase('waiting-download', info);
   });
-  const { x0, D, H, W } = await sampleVoxels(net, qr.version, themeIdx, qr, onPhase);
+  // Per-species mean training attributes for this version — a "typical" tree.
+  const attr = (m.attrs && m.attrs[themeMeta.name] && m.attrs[themeMeta.name][String(qr.version)])
+    || [0.5, 0.5, 0.5];
+  const { x0, D, H, W } = await sampleVoxels(net, qr.version, themeIdx, qr, attr, onPhase);
   const cells = buildCells(x0, D, H, W, qr, themeMeta);
   return { cells, version: qr.version, theme: themeMeta.name, url };
 }

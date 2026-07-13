@@ -601,10 +601,10 @@ THEME_NAMES = list(THEMES)
 
 # Tree attribute measurement — used as attribute signals during training
 # (height / fullness / spread), each normalized to [0, 1].
-# Height is normalized against the fixed Z extent (30 ≈ usable canopy span).
-# Fullness and spread scale with QR side length so the signal stays in [0,1]
-# regardless of QR version.
-_ATTR_HEIGHT_NORM = 30.0
+# All three normalizations scale with the QR version so the signal stays
+# informative across grid sizes: height against the version's usable Z
+# extent (93.75% of the grid height — 30/32 at v1), fullness quadratically
+# with the footprint (≈ canopy area), spread linearly with it.
 
 
 def tree_attributes(voxels, qr_side: int | None = None):
@@ -621,11 +621,40 @@ def tree_attributes(voxels, qr_side: int | None = None):
     ys = [v["pos"][1] for v in tv]
     xs = [v["pos"][0] for v in tv]
     zs = [v["pos"][2] for v in tv]
-    # Fullness normalization grows quadratically with footprint (≈ canopy area).
-    # Spread normalization grows linearly with footprint.
+    grid_z = max(32, (math.ceil(qr_side * 32 / 21 / 4)) * 4)   # same H as _gen
     full_norm = 1800.0 * (qr_side / 21.0) ** 2
     spread_norm = max(2.0, qr_side - 0.0)
-    height = max(ys) / _ATTR_HEIGHT_NORM
+    height = max(ys) / (0.9375 * grid_z)
     fullness = len(tv) / full_norm
     spread = max(max(xs) - min(xs), max(zs) - min(zs)) / spread_norm
     return [min(1.0, max(0.0, a)) for a in (height, fullness, spread)]
+
+
+_ATTR_MEAN_CACHE: dict = {}
+
+
+def attr_means(theme: str, version: int, n: int = 32, seed: int = 20260713):
+    """Mean [height, fullness, spread] of augmented training trees for
+    (theme, version).
+
+    This is the in-distribution conditioning for a "typical" tree of that
+    species at that QR version — attribute distributions differ strongly per
+    species (e.g. palm height ≈ 1.0 vs acacia ≈ 0.5 at v4), so a global
+    mid-value like 0.5 sits outside most species' training range and skews
+    generation. Sampled once per (theme, version) per process and cached.
+    """
+    key = (theme, int(version))
+    hit = _ATTR_MEAN_CACHE.get(key)
+    if hit is not None:
+        return hit
+    from qrbloom.qr import random_qr_core
+    rng = random.Random(seed + version * 101)
+    npr = np.random.default_rng(seed + version * 101)
+    acc = np.zeros(3)
+    for _ in range(n):
+        core = random_qr_core(npr, version=version)
+        vox = _gen(core.tolist(), theme, rng, augment=True)
+        acc += np.array(tree_attributes(vox, qr_side=core.shape[0]))
+    out = [float(round(x, 4)) for x in (acc / n)]
+    _ATTR_MEAN_CACHE[key] = out
+    return out

@@ -30,7 +30,7 @@ import torch
 from qrbloom.diffusion import Diffusion, X0_CH, N_THEMES
 from qrbloom.dit import DiT3D
 from qrbloom.qr import grid_xy_for_version, grid_z_for_version
-from qrbloom.treegen import LABELS, THEMES
+from qrbloom.treegen import LABELS, THEMES, attr_means
 
 OUT = "docs/assets"
 os.makedirs(OUT, exist_ok=True)
@@ -93,13 +93,17 @@ themes = [{"name": k, "label": LABELS.get(k, k),
            "flower": v.get("flower", [])}
           for k, v in THEMES.items()]
 
+# Per-(theme, version) mean training attributes — the browser conditions
+# generation on these so every species gets its "typical" proportions.
+attrs = {k: {str(v): attr_means(k, v) for v in VERSIONS} for k in THEMES}
+
 top = {"format_version": 3, "model_type": "qrbloom-dit3d-tfjs",
        "weights": "weights_all.bin", "params": "manifest_all.json",
        "bytes": len(buf), "sha256": hashlib.sha256(bytes(buf)).hexdigest(),
        "trained_versions": VERSIONS,
        "versions": {str(v): {"grid_xy": grids[str(v)][0],
                              "grid_z": grids[str(v)][2]} for v in VERSIONS},
-       "themes": themes}
+       "attrs": attrs, "themes": themes}
 with open(f"{OUT}/manifest.json", "w") as f:
     json.dump(top, f)
 print(f"exported {len(records)} params, {len(buf)/1e6:.1f}MB, "
