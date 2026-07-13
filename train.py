@@ -34,8 +34,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Subset, TensorDataset
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from qrbloom.diffusion import Diffusion, EMA, DOWNSCALE
@@ -79,6 +78,10 @@ EPOCH_SIZE = int(os.environ.get("EPOCH_SIZE", "100000"))   # live-generated samp
 VAL_SIZE = int(os.environ.get("VAL_SIZE", "2400"))         # fixed validation set size
 VARIANT = os.environ.get("VARIANT", "")
 SUFFIX = VARIANT
+# Warm-start checkpoint: weights are loaded non-strict into the fresh model
+# (e.g. seed a multi-version run from a single-version specialist). Ignored
+# when a resume checkpoint for this VARIANT already exists.
+INIT_FROM = os.environ.get("INIT_FROM", "")
 
 # ── DiT backbone hyperparameters ──────────────────────────────────────────────
 DIT_DIM = int(os.environ.get("DIT_DIM", "384"))
@@ -149,22 +152,74 @@ if torch.cuda.is_available():
 LOSS_KEYS = ("v_mse", "v_rgb", "v_occ")
 
 
+def _version_for_index(idx: int, versions, weights, batch: int, seed: int) -> int:
+    """QR version for sample `idx`, constant within each batch-sized block.
+
+    Bucketed batching (NovelAI-style aspect-ratio bucketing, adapted to QR
+    versions): BlockBatchSampler emits contiguous index blocks and this pure
+    function assigns each block a single version, so every batch is uniform
+    in grid size — no padding voxels, no attention over padding tokens.
+    Being a pure function of (idx, seed), the sampler and every DataLoader
+    worker agree on the schedule without shared state.
+    """
+    if len(versions) == 1:
+        return versions[0]
+    ws = weights if weights is not None else [1.0] * len(versions)
+    r = _random.Random(seed * 1000003 + idx // batch).random() * sum(ws)
+    acc = 0.0
+    for v, w in zip(versions, ws):
+        acc += w
+        if r < acc:
+            return v
+    return versions[-1]
+
+
+class BlockBatchSampler(torch.utils.data.Sampler):
+    """Yields contiguous index blocks of size `batch` (one QR version each).
+
+    Blocks are interleaved across DDP ranks and their order is shuffled per
+    epoch; indices inside a block stay contiguous so `_version_for_index`
+    holds one version for the whole batch.
+    """
+
+    def __init__(self, n: int, batch: int, world: int = 1, rank: int = 0,
+                 shuffle: bool = True, seed: int = 0):
+        self.batch = batch
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self.blocks = [b for b in range(n // batch) if b % world == rank]
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __len__(self):
+        return len(self.blocks)
+
+    def __iter__(self):
+        order = list(self.blocks)
+        if self.shuffle:
+            _random.Random(self.seed + self.epoch).shuffle(order)
+        for b in order:
+            yield list(range(b * self.batch, (b + 1) * self.batch))
+
+
 class LiveTreeDataset(torch.utils.data.Dataset):
     """Dataset that generates a fresh (QR, theme, augmentation) sample on every access.
 
-    Each sample is built for a random QR version drawn from `versions`. The
-    voxel grid's XY *and Z* size both depend on the version (isotropic
-    scaling — see qrbloom.qr.grid_z_for_version). The custom collate
-    (`pad_collate`) pads a mixed-version batch to the largest XY and Z in
-    the batch so DataLoader can stack tensors.
+    Each sample is built for the QR version that `_version_for_index`
+    assigns to its batch block, so grids inside one batch always match.
+    The voxel grid's XY *and Z* size both depend on the version (isotropic
+    scaling — see qrbloom.qr.grid_z_for_version).
 
     deterministic=False (train): each sample uses system entropy — no repeats.
     deterministic=True  (val):   each index maps to a fixed seed — reproducible.
 
-    Returns: (occ_u8, rgb_u8, qr_u8, theme_idx, attr)
+    Returns: (occ_u8, rgb_u8, qr_u8, theme_idx, attr, version)
     """
 
-    def __init__(self, virtual_len, versions, deterministic, seed=0, weights=None):
+    def __init__(self, virtual_len, versions, deterministic, seed=0, weights=None,
+                 batch=1):
         self.virtual_len = int(virtual_len)
         self.versions = list(versions)
         # weights=None → uniform sampling (used for val so the metric is
@@ -173,6 +228,7 @@ class LiveTreeDataset(torch.utils.data.Dataset):
         self.weights = list(weights) if weights is not None else None
         self.deterministic = deterministic
         self.seed = seed
+        self.batch = int(batch)
 
     def __len__(self):
         return self.virtual_len
@@ -185,10 +241,8 @@ class LiveTreeDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         rng, nprng = self._rng(idx)
-        if self.weights is None:
-            version = self.versions[rng.randint(0, len(self.versions) - 1)]
-        else:
-            version = rng.choices(self.versions, weights=self.weights, k=1)[0]
+        version = _version_for_index(idx, self.versions, self.weights,
+                                     self.batch, self.seed)
         qe = qr_modules(version)
         gxy = grid_xy_for_version(version)
         gz  = grid_z_for_version(version)
@@ -224,9 +278,11 @@ class LiveTreeDataset(torch.utils.data.Dataset):
 def pad_collate(batch):
     """Collate items of varying XY/Z by zero-padding to the largest in the batch.
 
-    XY padding is symmetric around the QR center; Z padding is one-sided
-    (extend upward) so the QR base plane stays at z=0. Both XY and Z are
-    rounded up to multiples of DOWNSCALE so the U-Net can up/down cleanly.
+    With bucketed batching every batch is a single version, so this is a
+    plain stack; the padding path remains as a safety net for callers that
+    mix versions. XY padding is symmetric around the QR center; Z padding
+    is one-sided (extend upward) so the QR base plane stays at z=0. Both
+    are rounded up to multiples of DOWNSCALE.
 
     Input shapes per sample:
       occ : (gxy, gxy, gz)
@@ -356,13 +412,19 @@ def evaluate(model, diff, loader, device) -> dict:
     """Compute mean losses and occupancy IoU on the validation set.
 
     IoU is estimated by injecting low-level noise (t = T/10) and measuring
-    denoising accuracy at that timestep.
+    denoising accuracy at that timestep. Per-version mean losses are
+    reported as "v{N}" keys — in multi-version training a single version
+    can collapse while the aggregate mean still looks healthy, so each
+    version is watched separately.
     """
     model.eval()
     parts_sum = {k: 0.0 for k in LOSS_KEYS}
     parts_sum["total"] = 0.0
     iou_num = iou_den = 0.0
     n_batches = 0
+    ver_list = sorted(set(QR_VERSIONS_VAL))
+    ver_loss = {v: 0.0 for v in ver_list}
+    ver_n = {v: 0 for v in ver_list}
     t_probe = max(1, T // 10)
     with torch.no_grad():
         for occ_u8, rgb_u8, qr_u8, th, attr, ver in loader:
@@ -375,6 +437,10 @@ def evaluate(model, diff, loader, device) -> dict:
             for k, v in info.items():
                 parts_sum[k] += v.item()
             parts_sum["total"] += loss.item()
+            v0 = int(ver[0].item())          # bucketed batch: one version
+            if v0 in ver_loss:
+                ver_loss[v0] += loss.item()
+                ver_n[v0] += 1
             # Inject fixed small-t noise, recover x0, threshold occupancy for IoU.
             tb = torch.full((x0.size(0),), t_probe, dtype=torch.long, device=device)
             noise = torch.randn_like(x0)
@@ -392,7 +458,8 @@ def evaluate(model, diff, loader, device) -> dict:
     if IS_DIST:
         buf = torch.tensor(
             [parts_sum[k] for k in LOSS_KEYS] + [parts_sum["total"],
-             iou_num, iou_den, float(n_batches)],
+             iou_num, iou_den, float(n_batches)]
+            + [ver_loss[v] for v in ver_list] + [float(ver_n[v]) for v in ver_list],
             device=device, dtype=torch.float64,
         )
         dist.all_reduce(buf, op=dist.ReduceOp.SUM)
@@ -402,10 +469,16 @@ def evaluate(model, diff, loader, device) -> dict:
         parts_sum["total"] = vals[len(LOSS_KEYS)]
         iou_num, iou_den = vals[len(LOSS_KEYS) + 1], vals[len(LOSS_KEYS) + 2]
         n_batches = max(int(vals[len(LOSS_KEYS) + 3]), 1)
+        off = len(LOSS_KEYS) + 4
+        for i, v in enumerate(ver_list):
+            ver_loss[v] = vals[off + i]
+            ver_n[v] = int(vals[off + len(ver_list) + i])
 
     for k in parts_sum:
         parts_sum[k] /= max(n_batches, 1)
     parts_sum["iou"] = iou_num / max(iou_den, 1e-6)
+    for v in ver_list:
+        parts_sum[f"v{v}"] = ver_loss[v] / max(ver_n[v], 1)
     model.train()
     return parts_sum
 
@@ -503,8 +576,9 @@ def main():
 
     # Training samples are generated live; validation uses a fixed seed for reproducibility.
     train_ds = LiveTreeDataset(EPOCH_SIZE, versions=QR_VERSIONS, deterministic=False,
-                                weights=QR_VERSION_WEIGHTS)
-    val_ds = LiveTreeDataset(VAL_SIZE, versions=QR_VERSIONS_VAL, deterministic=True, seed=999)
+                                weights=QR_VERSION_WEIGHTS, batch=BATCH)
+    val_ds = LiveTreeDataset(VAL_SIZE, versions=QR_VERSIONS_VAL, deterministic=True, seed=999,
+                             batch=BATCH)
     _w_sum = sum(QR_VERSION_WEIGHTS) or 1.0
     _w_pct = [f"v{v}:{100*w/_w_sum:.0f}%" for v, w in zip(QR_VERSIONS, QR_VERSION_WEIGHTS)]
     log(f"[data] live generation — epoch_size={EPOCH_SIZE} val={VAL_SIZE}  "
@@ -512,22 +586,17 @@ def main():
         f"max_xy={MAX_XY}  max_z={MAX_Z}")
     log(f"[data] train weights — {' '.join(_w_pct)}  (raw={QR_VERSION_WEIGHTS})")
 
-    if IS_DIST:
-        train_sampler = DistributedSampler(train_ds, num_replicas=WORLD_SIZE,
-                                           rank=RANK, shuffle=True, drop_last=True, seed=SEED)
-        val_sampler = DistributedSampler(val_ds, num_replicas=WORLD_SIZE,
-                                         rank=RANK, shuffle=False, drop_last=False)
-    else:
-        train_sampler = None
-        val_sampler = None
+    # Bucketed batching: block samplers keep every batch single-version.
+    train_sampler = BlockBatchSampler(len(train_ds), BATCH, world=WORLD_SIZE,
+                                      rank=RANK, shuffle=True, seed=SEED)
+    val_sampler = BlockBatchSampler(len(val_ds), BATCH, world=WORLD_SIZE,
+                                    rank=RANK, shuffle=False)
 
     _dl_kw = dict(num_workers=WORKERS, pin_memory=True, collate_fn=pad_collate)
     if WORKERS > 0:
         _dl_kw.update(persistent_workers=True, prefetch_factor=4)
-    train_dl = DataLoader(train_ds, batch_size=BATCH, sampler=train_sampler,
-                          shuffle=(train_sampler is None), drop_last=True, **_dl_kw)
-    val_dl = DataLoader(val_ds, batch_size=BATCH, sampler=val_sampler,
-                        shuffle=False, **_dl_kw)
+    train_dl = DataLoader(train_ds, batch_sampler=train_sampler, **_dl_kw)
+    val_dl = DataLoader(val_ds, batch_sampler=val_sampler, **_dl_kw)
     log(f"[loader] steps/epoch(per-rank)={len(train_dl)}  val batches(per-rank)={len(val_dl)}  "
         f"workers={WORKERS}  amp={AMP_DTYPE}  world={WORLD_SIZE}  batch/gpu={BATCH}  "
         f"global_batch={BATCH * WORLD_SIZE}")
@@ -546,8 +615,11 @@ def main():
         alnum_chars = string.ascii_letters + string.digits
         PORTFOLIO_URL = os.environ.get("DEMO_URL", "https://example.com")
         # Pick a version (rotates each restart via the seed); the same version
-        # is used for all 9 montage samples.
-        mont_version = QR_VERSIONS_VAL[rng.randint(0, len(QR_VERSIONS_VAL) - 1)]
+        # is used for all 9 montage samples. MONT_VERSION pins it explicitly —
+        # useful to keep an eye on the riskiest version in multi-version runs.
+        _mv = os.environ.get("MONT_VERSION", "").strip()
+        mont_version = int(_mv) if _mv else \
+            QR_VERSIONS_VAL[rng.randint(0, len(QR_VERSIONS_VAL) - 1)]
         m_qe = qr_modules(mont_version)
         m_gxy = grid_xy_for_version(mont_version)
         m_gz  = grid_z_for_version(mont_version)
@@ -614,6 +686,12 @@ def main():
     n_params = sum(p.numel() for p in base_model.parameters())
     log(f"[model] DiT3D params={n_params/1e6:.2f}M  "
         f"dim={DIT_DIM} depth={DIT_DEPTH} heads={DIT_HEADS} patch={DIT_PATCH}")
+    if INIT_FROM and not CKPT.exists():
+        ck0 = torch.load(INIT_FROM, map_location=DEVICE, weights_only=False)
+        src = ck0.get("ema") or ck0.get("model")
+        missing, unexpected = base_model.load_state_dict(src, strict=False)
+        log(f"[init] warm start from {INIT_FROM} (epoch {ck0.get('epoch', '?')})  "
+            f"missing={len(missing)} unexpected={len(unexpected)}")
     diff = Diffusion(T=T, device=DEVICE)
     ema = EMA(base_model, decay=0.999)
 
@@ -719,9 +797,12 @@ def main():
             val_metrics = {"total": float("inf"), "iou": 0.0}
             for k in LOSS_KEYS:
                 val_metrics[k] = 0.0
+        _pv = "  ".join(f"v{v}={val_metrics[f'v{v}']:.4f}"
+                        for v in sorted(set(QR_VERSIONS_VAL))
+                        if f"v{v}" in val_metrics)
         log(f"[ep{ep:03d}] train_total={epoch_parts['total']:.4f}  "
             f"val_total={val_metrics['total']:.4f}  val_iou={val_metrics['iou']:.3f}  "
-            f"lr={lr:.2e}")
+            f"lr={lr:.2e}" + (f"  |  {_pv}" if _pv else ""))
         log(f"   parts: v_mse={epoch_parts['v_mse']:.4f}  "
             f"v_rgb={epoch_parts['v_rgb']:.4f}  v_occ={epoch_parts['v_occ']:.4f}")
 

@@ -115,6 +115,13 @@ class DiT3D(nn.Module):
         self.theme_emb = nn.Embedding(n_themes, dim)
         self.attr_mlp = nn.Sequential(nn.Linear(3, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.attr_null = nn.Parameter(torch.zeros(dim))
+        # QR-version micro-conditioning (as in SDXL's size conditioning):
+        # Fourier features of the module count, added to the adaLN vector.
+        # Zero-initialized output → a fresh or warm-started model behaves as
+        # if unconditioned until multi-version training gives it gradient.
+        self.ver_mlp = nn.Sequential(nn.Linear(256, dim), nn.SiLU(), nn.Linear(dim, dim))
+        nn.init.zeros_(self.ver_mlp[2].weight)
+        nn.init.zeros_(self.ver_mlp[2].bias)
 
         self.blocks = nn.ModuleList([DiTBlock(dim, heads) for _ in range(depth)])
 
@@ -148,7 +155,8 @@ class DiT3D(nn.Module):
             attr:      Shape attribute vector, shape (B, 3), values in [0, 1].
             attr_mask: Binary mask, shape (B,). 1 = use attr conditioning,
                        0 = use the unconditional null token (CFG training).
-            version:   Accepted for the Diffusion interface; unused.
+            version:   QR version indices, shape (B,). Optional — omit for
+                       single-version models.
         """
         B, _, D, H, W = x.shape
         p = self.patch
@@ -161,6 +169,11 @@ class DiT3D(nn.Module):
             m = attr_mask.view(-1, 1).float()
             attr_emb = m * attr_emb + (1.0 - m) * self.attr_null
         c = c + attr_emb
+        if version is not None:
+            if not torch.is_tensor(version):
+                version = torch.full((B,), int(version), device=x.device)
+            modules = version.float() * 4.0 + 17.0        # QR modules per side
+            c = c + self.ver_mlp(timestep_embedding(modules, 256))
 
         h = self.patch_embed(torch.cat([x, cond], dim=1))        # (B, dim, D', H', W')
         dp, hp, wp = h.shape[2], h.shape[3], h.shape[4]
