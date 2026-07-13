@@ -166,10 +166,11 @@ class Diffusion:
         eps = sigma * x_t + alpha * v    (noise estimate)
     """
 
-    def __init__(self, T: int = 500, device: str = "cuda", rgb_weight: float = 1.5,
-                 occ_color_w: float = 20.0):
-        self.rgb_weight = float(rgb_weight)
-        self.occ_color_w = float(occ_color_w)
+    def __init__(self, T: int = 500, device: str = "cuda",
+                 rgb_empty_w: float = 0.05):
+        # rgb_empty_w: colour-loss weight on empty (in-footprint) voxels
+        # relative to occupied ones — see p_losses.
+        self.rgb_empty_w = float(rgb_empty_w)
         self.T = T
         self.betas = cosine_beta_schedule(T).to(device)
         self.alphas = 1.0 - self.betas
@@ -288,10 +289,17 @@ class Diffusion:
         # Spatial weight map: occ voxels → pos_w, empty-in-footprint → 1.0
         vox_w  = occ_gt * pos_w + (1.0 - occ_gt) * m          # (B, 1, D, H, W)
 
-        # RGB loss (ch 0-2): unweighted per-sample MSE in footprint.
-        m_one = m.expand(-1, 3, -1, -1, -1)
-        v_rgb_ps = (sq[:, :3] * m_one).sum(dim=[1, 2, 3, 4]) / \
-                   m_one.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
+        # RGB loss (ch 0-2): ~90% of footprint voxels are empty (black), so an
+        # unweighted footprint mean spends most of the colour gradient on
+        # "paint empty space black" and palette colours are learned slowly.
+        # Down-weight empty voxels to rgb_empty_w instead of masking them out
+        # entirely: intermediate sampling states feed empty-voxel colours back
+        # into the network, so they must stay supervised (anchored to black)
+        # to keep the reverse process in-distribution — a hard mask would let
+        # them drift arbitrarily mid-sampling.
+        rgb_w = (occ_gt + (m - occ_gt) * self.rgb_empty_w).expand(-1, 3, -1, -1, -1)
+        v_rgb_ps = (sq[:, :3] * rgb_w).sum(dim=[1, 2, 3, 4]) / \
+                   rgb_w.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
 
         # Occupancy loss (ch 3): per-voxel pos-weighted MSE in footprint.
         v_occ_ps = (sq[:, 3:4] * vox_w).sum(dim=[1, 2, 3, 4]) / \

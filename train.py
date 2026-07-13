@@ -82,6 +82,10 @@ SUFFIX = VARIANT
 # (e.g. seed a multi-version run from a single-version specialist). Ignored
 # when a resume checkpoint for this VARIANT already exists.
 INIT_FROM = os.environ.get("INIT_FROM", "")
+# RESET_BEST=1 discards the historical best on resume. Required when the
+# loss definition changes mid-run: the stale best (old loss scale) could
+# otherwise never be beaten and best-checkpoint saving would stall.
+RESET_BEST = bool(int(os.environ.get("RESET_BEST", "0")))
 
 # ── DiT backbone hyperparameters ──────────────────────────────────────────────
 DIT_DIM = int(os.environ.get("DIT_DIM", "384"))
@@ -727,7 +731,7 @@ def main():
                 pass
         start_epoch = ck["epoch"] + 1
         hist = ck["hist"]
-        if hist:
+        if hist and not RESET_BEST:
             vals = [h.get("val_total") for h in hist if h.get("val_total") is not None]
             if vals:
                 best_val = min(vals)
