@@ -10,13 +10,12 @@ gallery: an epoch slider, a theme/sample dropdown, and polling for new epochs.
 Usage: python gallery.py [--port 8000]
 """
 import argparse
-import json
 import os
 import re
 import threading
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 import uvicorn
@@ -36,11 +35,11 @@ RUNS_DIR = os.path.join(ROOT, "runs")
 CKPT_DIR = os.path.join(ROOT, "checkpoints")
 LOG = os.path.join(RUNS_DIR, "train.log")
 
-# Model inference state — loaded lazily per version.
-# Each per-version checkpoint (qrbloom_v{N}.pt) is loaded on first use and
-# cached. Falls back to qrbloom.pt if a version-specific file isn't found.
-_model_locks: dict = {}              # {version: Lock()} — per-version to allow parallel inference
-_model_ctx_per_version: dict = {}    # {version: {model, diff, ep, device, mtime, ...}}
+# Model inference state — one DiT3D checkpoint serves every trained QR
+# version (the version enters the net as conditioning). Loaded lazily and
+# hot-reloaded when the checkpoint file changes (live training updates).
+_model_lock = threading.Lock()
+_model_ctx: dict | None = None
 
 
 def _pick_inference_device():
@@ -67,88 +66,60 @@ def _pick_inference_device():
     return "cpu"
 
 
-def _ckpt_path_for_version(version: int) -> str:
-    """Per-version checkpoint path. Preference order:
-    1. `qrbloom_v{N}_best.pt` — lowest validation loss so far (best quality)
-    2. `qrbloom_v{N}.pt`      — latest epoch (live snapshot during training)
-    3. `qrbloom_best.pt`      — legacy single-model best
-    4. `qrbloom.pt`           — legacy single-model latest
-    Set GALLERY_USE_LATEST=1 to skip best and use the live snapshot instead.
-    """
+def _ckpt_path() -> str:
+    """Checkpoint path. Prefers the best-validation file; set
+    GALLERY_USE_LATEST=1 to use the live training snapshot instead."""
     use_latest = bool(int(os.environ.get("GALLERY_USE_LATEST", "0")))
     if not use_latest:
-        best_v = os.path.join(CKPT_DIR, f"qrbloom_v{version}_best.pt")
-        if os.path.exists(best_v):
-            return best_v
-    per_v = os.path.join(CKPT_DIR, f"qrbloom_v{version}.pt")
-    if os.path.exists(per_v):
-        return per_v
-    if not use_latest:
-        legacy_best = os.path.join(CKPT_DIR, "qrbloom_best.pt")
-        if os.path.exists(legacy_best):
-            return legacy_best
-    legacy = os.path.join(CKPT_DIR, "qrbloom.pt")
-    return legacy
+        best = os.path.join(CKPT_DIR, "qrbloom_all_best.pt")
+        if os.path.exists(best):
+            return best
+    return os.path.join(CKPT_DIR, "qrbloom_all.pt")
 
 
-def _load_model(version: int | None = None):
-    """Load (or hot-reload) the checkpoint for a specific QR version.
+def _load_model():
+    """Load (or hot-reload) the model checkpoint.
 
-    Each version has its own model + checkpoint (qrbloom_v{N}.pt). The cached
-    entry is reloaded if the file mtime changes (live training updates).
-
-    If `version` is None, picks the smallest trained version available.
+    The cached entry is reloaded if the file mtime changes (live training
+    updates). One DiT3D serves every trained QR version.
     """
-    global _model_ctx_per_version
+    global _model_ctx
     import torch
     import numpy as np
-    from qrbloom.diffusion import UNet3D, Diffusion
+    from qrbloom.model import DiT3D, Diffusion
     from qrbloom.treegen import THEMES as VTHEMES
     from qrbloom.qr import THEME_NAMES as _THEMES
 
-    if version is None:
-        trained = _trained_versions() or [2]
-        version = trained[0]
-    version = int(version)
-
-    ck_path = _ckpt_path_for_version(version)
+    ck_path = _ckpt_path()
     if not os.path.exists(ck_path):
         # ValueError (not FileNotFoundError) so the API exception handler can
         # safely surface the message without risking that some unrelated
         # FileNotFoundError from torch / disk I/O leaks a raw path.
-        raise ValueError(
-            f"No trained model is available for QR version {version}.")
+        raise ValueError("No trained model is available.")
     real_path = os.path.realpath(ck_path)
     mtime = os.path.getmtime(real_path)
 
-    cached = _model_ctx_per_version.get(version)
+    cached = _model_ctx
     if cached is not None and cached.get("mtime") == mtime and cached.get("ck_path") == ck_path:
         return cached
 
     DEVICE = (cached["device"] if cached is not None else _pick_inference_device())
     ck = torch.load(ck_path, map_location=DEVICE, weights_only=False)
-    # Per-version model: head ModuleList has a single entry (this version).
     if cached is None:
-        m = UNet3D(ch=48, n_themes=len(_THEMES),
-                    versions=(version,)).to(DEVICE)
+        m = DiT3D(n_themes=len(_THEMES)).to(DEVICE)
         diff = Diffusion(T=500, device=DEVICE)
     else:
         m = cached["model"]
         diff = cached["diff"]
-    try:
-        m.load_state_dict(ck["ema"])
-    except RuntimeError:
-        # Legacy multi-version checkpoint: filter keys for this single-version model.
-        sd = {k: v for k, v in ck["ema"].items() if k in m.state_dict()}
-        m.load_state_dict(sd, strict=False)
+    m.load_state_dict(ck["ema"])
     m.eval()
     ctx = {
         "model": m, "diff": diff, "ep": ck["epoch"], "device": DEVICE, "mtime": mtime,
         "themes": _THEMES, "vthemes": VTHEMES, "np": np, "torch": torch,
-        "version": version, "ck_path": ck_path,
+        "ck_path": ck_path,
     }
-    _model_ctx_per_version[version] = ctx
-    print(f"[model] v{version} loaded ep{ck['epoch']} on {DEVICE} ({ck_path})", flush=True)
+    _model_ctx = ctx
+    print(f"[model] loaded ep{ck['epoch']} on {DEVICE} ({ck_path})", flush=True)
     return ctx
 
 
@@ -199,9 +170,9 @@ def model_generate(url: str, theme_name: str, steps: int = 100,
             qr = segno.make(text, error="m", version=version)
         except Exception as e:
             raise ValueError("Text doesn't fit in the selected QR version.") from e
-    # Load the model for this specific version (each version is a separate file).
-    ctx = _load_model(version)
-    np = ctx["np"]; torch = ctx["torch"]
+    ctx = _load_model()
+    np = ctx["np"]
+    torch = ctx["torch"]
     core = np.array([[1 if c else 0 for c in row] for row in qr.matrix],
                     dtype=np.uint8)
     qe = qr_modules(version)
@@ -227,7 +198,7 @@ def model_generate(url: str, theme_name: str, steps: int = 100,
     attr = torch.tensor([attr_means(theme_name, version)], device=dev,
                         dtype=torch.float32)
     ver_t = torch.tensor([int(version)], device=dev, dtype=torch.long)
-    with _model_locks.setdefault(version, threading.Lock()), torch.no_grad():
+    with _model_lock, torch.no_grad():
         x0 = ctx["diff"].sample(ctx["model"], cond, th_t, attr=attr, steps=steps,
                                 device=dev, eta=1.0, version=ver_t).cpu().numpy()[0]
     occ = (x0[3] > 0)
@@ -255,38 +226,15 @@ def model_generate(url: str, theme_name: str, steps: int = 100,
 
 
 def _trained_versions() -> list[int]:
-    """Detect which QR versions have a trained model available.
+    """QR versions the model was trained on.
 
-    Preference order:
-    1. Per-version checkpoints: scan checkpoints/qrbloom_v{N}.pt for N in 1..40.
-       This matches the split-model training (one model per version).
-    2. Legacy single-checkpoint runs/unseen_gt.json (multi-version MoE).
+    The single checkpoint covers all of them; the set itself comes from the
+    QRBLOOM_VERSIONS env (default 2..5, matching the training default).
     """
-    # 1) Per-version split-model checkpoints — recognise either the live
-    #    snapshot (qrbloom_v{N}.pt) OR the best-val file (qrbloom_v{N}_best.pt).
-    #    A deployment may carry only the *_best.pt files (smaller bundle).
-    per_v = []
-    for v in range(1, 41):
-        live = os.path.join(CKPT_DIR, f"qrbloom_v{v}.pt")
-        best = os.path.join(CKPT_DIR, f"qrbloom_v{v}_best.pt")
-        if os.path.exists(live) or os.path.exists(best):
-            per_v.append(v)
-    if per_v:
-        return per_v
-    # 2) Legacy: read unseen_gt.json
-    gt_path = os.path.join(RUNS_DIR, "unseen_gt.json")
-    if not os.path.exists(gt_path):
+    if not os.path.exists(_ckpt_path()):
         return []
-    try:
-        with open(gt_path) as f:
-            d = json.load(f)
-        if isinstance(d.get("trained_versions"), list):
-            return sorted(set(int(v) for v in d["trained_versions"]))
-        if "version" in d:
-            return [int(d["version"])]
-    except Exception:
-        pass
-    return []
+    raw = os.environ.get("QRBLOOM_VERSIONS", "2,3,4,5")
+    return sorted({int(v) for v in raw.split(",") if v.strip()})
 
 
 def pick_version_for_text(text: str) -> tuple["object", int]:
@@ -363,8 +311,8 @@ def get_state():
     try:
         import torch
         ck_pair = [
-            (os.path.join(CKPT_DIR, "qrbloom.pt"), "latest_ep"),
-            (os.path.join(CKPT_DIR, "qrbloom_best.pt"), "best_ep"),
+            (os.path.join(CKPT_DIR, "qrbloom_all.pt"), "latest_ep"),
+            (os.path.join(CKPT_DIR, "qrbloom_all_best.pt"), "best_ep"),
         ]
         for path, key in ck_pair:
             if os.path.exists(path):

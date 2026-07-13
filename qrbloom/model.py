@@ -1,18 +1,27 @@
 # SPDX-FileCopyrightText: 2026 rocknroll17
 # SPDX-License-Identifier: MIT
 
-"""Denoising diffusion model for 3D voxel tree generation conditioned on a QR footprint.
+"""QR-Bloom model — DiT3D backbone + v-prediction diffusion process.
 
-The model generates a 4-channel (RGB + occupancy) voxel grid of shape
-(B, 4, D, H, W) using v-prediction (Salimans & Ho 2022) with stochastic
-(DDPM-equivalent) sampling. **All three spatial dimensions are variable**:
-XY (D, H) and Z (W) both scale with the QR version. The U-Net is fully
-convolutional, so a single trained model handles any voxel grid whose
-spatial dims are multiples of DOWNSCALE (=4, set by the 2 down/up stages).
+One model covers every trained QR version. The denoiser is a diffusion
+transformer (DiT, Peebles & Xie 2023; adapted to voxel grids as in DiT-3D,
+Mo et al. 2023): voxel patchify → transformer blocks with adaLN-Zero
+conditioning → linear unpatchify head.
 
-Conditioning inputs are a QR footprint mask, a discrete theme index, and a
-3-dimensional shape attribute vector. Classifier-free guidance (CFG) is
-supported for the attribute signal at inference time.
+* patch=4 keeps token counts small (v4: 36x36x52 grid → 9x9x13 = 1,053
+  tokens), so every block runs full global attention — the receptive field
+  spans the entire grid at every layer, at every QR version.
+* 3D sine-cosine positional embeddings are computed from the actual (D,H,W)
+  of each input and cached, so one set of weights accepts any grid whose
+  spatial dims are multiples of `patch`.
+* Conditioning (timestep, theme, shape attributes, QR version) enters
+  through adaLN-Zero. The attribute pathway carries a learnable null token
+  so classifier-free guidance can drop it during training and amplify it at
+  sampling time; the version enters as Fourier features of the QR module
+  count (micro-conditioning as in SDXL's size conditioning).
+
+The diffusion process is v-prediction (Salimans & Ho 2022) over a 4-channel
+(RGB + occupancy) voxel grid with stochastic (DDPM-equivalent) sampling.
 
 Channel convention:
   x0[0..2] = R, G, B  in [-1, 1]   (uint8 0-255 mapped via / 127.5 - 1)
@@ -23,10 +32,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 X0_CH = 4           # voxel channels: RGB + occupancy
 N_THEMES = 10       # number of tree species (see qrbloom.treegen.THEMES)
-DOWNSCALE = 4       # U-Net has 2 downsampling stages → XY/Z must be multiple of 4
+DOWNSCALE = 4       # DiT patch size → spatial dims must be multiples of 4
 
 
 def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
@@ -44,81 +54,123 @@ def cosine_beta_schedule(T: int, s: float = 0.008) -> torch.Tensor:
     return torch.clamp(betas, 0.0001, 0.999)
 
 
-class ResBlock3D(nn.Module):
-    def __init__(self, cin, cout, tdim):
-        super().__init__()
-        self.norm1 = nn.GroupNorm(8, cin)
-        self.conv1 = nn.Conv3d(cin, cout, 3, padding=1)
-        self.temb = nn.Linear(tdim, cout)
-        self.norm2 = nn.GroupNorm(8, cout)
-        self.conv2 = nn.Conv3d(cout, cout, 3, padding=1)
-        self.skip = nn.Conv3d(cin, cout, 1) if cin != cout else nn.Identity()
-
-    def forward(self, x, temb):
-        h = self.conv1(F.silu(self.norm1(x)))
-        h = h + self.temb(temb)[:, :, None, None, None]
-        h = self.conv2(F.silu(self.norm2(h)))
-        return h + self.skip(x)
+# ---------------------------------------------------------------------------
+# DiT3D backbone
+# ---------------------------------------------------------------------------
+def _posemb_1d(dim: int, n: int, device, dtype):
+    """Standard 1D sin-cos table: (n, dim). dim must be even."""
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=device) / half)
+    args = torch.arange(n, device=device, dtype=torch.float32)[:, None] * freqs[None]
+    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1).to(dtype)
 
 
-class UNet3D(nn.Module):
-    """3D U-Net backbone for v-prediction denoising — single-version model.
+def posemb_3d(dim: int, d: int, h: int, w: int, device, dtype=torch.float32):
+    """3D sin-cos positional embedding, (d*h*w, dim).
 
-    Architecture:
-      encoder (d1, down1, d2, down2, d3)
-        → bottleneck (m1, m2)
-        → decoder (up2, u2, up1)
-        → head (head_u1 ResBlock + GroupNorm + Conv3d → 4 channels)
-
-    Each QR version trains a separate UNet3D with its own complete set of
-    parameters. There is no MoE — the previous multi-version-with-MoE-tail
-    design was abandoned because the shared body could not learn features
-    that worked across QR sizes (small versions kept collapsing). Splitting
-    one model per version made body, head, everything independent.
-
-    Input: 5 channels — 4-channel noised voxel grid concatenated with the
-    1-channel QR footprint mask. Output: 4-channel v prediction.
-
-    `versions` and the per-sample `version` argument are accepted only for
-    backward compatibility with the callers; they're ignored.
+    dim is split evenly across the three axes (each axis part must be even).
+    Token order matches x.flatten(2).transpose(1, 2) on a (B, C, D, H, W)
+    tensor: D-major, then H, then W.
     """
+    ad = dim // 3 - (dim // 3) % 2
+    aw = ad
+    ah = dim - ad - aw          # H takes the remainder (still even if dim is)
+    pd = _posemb_1d(ad, d, device, dtype)
+    ph = _posemb_1d(ah, h, device, dtype)
+    pw = _posemb_1d(aw, w, device, dtype)
+    out = torch.cat([
+        pd[:, None, None, :].expand(d, h, w, ad),
+        ph[None, :, None, :].expand(d, h, w, ah),
+        pw[None, None, :, :].expand(d, h, w, aw),
+    ], dim=-1)
+    return out.reshape(d * h * w, dim)
 
-    def __init__(self, ch: int = 48, tdim: int = 256, n_themes: int = N_THEMES,
-                 versions=None):
+
+class DiTBlock(nn.Module):
+    """Transformer block with adaLN-Zero conditioning."""
+
+    def __init__(self, dim: int, heads: int, mlp_ratio: float = 4.0):
         super().__init__()
-        self.ch = ch
-        # versions kept only for legacy call sites; this model is single-version.
-        self.versions = list(versions) if versions is not None else []
+        self.heads = heads
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        hidden = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(approximate="tanh"),
+                                 nn.Linear(hidden, dim))
+        # adaLN-Zero: 6 modulation vectors, zero-initialized so every block
+        # starts as identity — the standard recipe for stable DiT training.
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        nn.init.zeros_(self.ada[1].weight)
+        nn.init.zeros_(self.ada[1].bias)
 
-        self.tmlp = nn.Sequential(nn.Linear(ch, tdim), nn.SiLU(), nn.Linear(tdim, tdim))
-        self.theme_emb = nn.Embedding(n_themes, tdim)
-        # Shape attributes (height, density, width) → tdim conditioning vector.
-        # attr_null is the learnable null token used for CFG training.
-        self.attr_mlp = nn.Sequential(nn.Linear(3, tdim), nn.SiLU(),
-                                      nn.Linear(tdim, tdim))
-        self.attr_null = nn.Parameter(torch.zeros(tdim))
+    def _attn(self, x):
+        B, L, C = x.shape
+        qkv = self.qkv(x).reshape(B, L, 3, self.heads, C // self.heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)                    # (B, nh, L, hd)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(B, L, C)
+        return self.proj(out)
 
-        # ── encoder ──────────────────────────────────────────────────────
-        self.in_conv = nn.Conv3d(X0_CH + 1, ch, 3, padding=1)
-        self.d1 = ResBlock3D(ch, ch, tdim)
-        self.down1 = nn.Conv3d(ch, ch, 4, 2, 1)
-        self.d2 = ResBlock3D(ch, ch * 2, tdim)
-        self.down2 = nn.Conv3d(ch * 2, ch * 2, 4, 2, 1)
-        self.d3 = ResBlock3D(ch * 2, ch * 4, tdim)
-        # ── bottleneck ───────────────────────────────────────────────────
-        self.m1 = ResBlock3D(ch * 4, ch * 4, tdim)
-        self.m2 = ResBlock3D(ch * 4, ch * 4, tdim)
-        # ── decoder ──────────────────────────────────────────────────────
-        self.up2 = nn.ConvTranspose3d(ch * 4, ch * 4, 4, 2, 1)
-        self.u2 = ResBlock3D(ch * 4 + ch * 2, ch * 2, tdim)
-        self.up1 = nn.ConvTranspose3d(ch * 2, ch * 2, 4, 2, 1)
-        # ── head ─────────────────────────────────────────────────────────
-        self.head_u1 = ResBlock3D(ch * 2 + ch, ch, tdim)
-        self.head_norm = nn.GroupNorm(8, ch)
-        self.head_conv = nn.Conv3d(ch, X0_CH, 3, padding=1)
+    def forward(self, x, c):
+        sh1, sc1, g1, sh2, sc2, g2 = self.ada(c)[:, None, :].chunk(6, dim=-1)
+        x = x + g1 * self._attn(self.norm1(x) * (1 + sc1) + sh1)
+        x = x + g2 * self.mlp(self.norm2(x) * (1 + sc2) + sh2)
+        return x
+
+
+class DiT3D(nn.Module):
+    """Denoising backbone: patchified voxel tokens + adaLN-Zero transformer."""
+
+    def __init__(self, dim: int = 384, depth: int = 12, heads: int = 6,
+                 patch: int = 4, n_themes: int = N_THEMES,
+                 grad_checkpoint: bool = False):
+        super().__init__()
+        self.dim = dim
+        self.patch = patch
+        self.grad_checkpoint = grad_checkpoint
+
+        # Patchify: 5 input channels (voxels + QR footprint) → dim per patch.
+        self.patch_embed = nn.Conv3d(X0_CH + 1, dim, patch, stride=patch)
+
+        # Conditioning: timestep MLP + theme embedding + attribute MLP with
+        # a learnable null token for CFG dropout.
+        self.tmlp = nn.Sequential(nn.Linear(256, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.theme_emb = nn.Embedding(n_themes, dim)
+        self.attr_mlp = nn.Sequential(nn.Linear(3, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.attr_null = nn.Parameter(torch.zeros(dim))
+        # QR-version micro-conditioning (as in SDXL's size conditioning):
+        # Fourier features of the module count, added to the adaLN vector.
+        # Zero-initialized output → a fresh or warm-started model behaves as
+        # if unconditioned until multi-version training gives it gradient.
+        self.ver_mlp = nn.Sequential(nn.Linear(256, dim), nn.SiLU(), nn.Linear(dim, dim))
+        nn.init.zeros_(self.ver_mlp[2].weight)
+        nn.init.zeros_(self.ver_mlp[2].bias)
+
+        self.blocks = nn.ModuleList([DiTBlock(dim, heads) for _ in range(depth)])
+
+        # Output head, adaLN-modulated and zero-initialized like DiT's.
+        self.norm_f = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.ada_f = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim))
+        self.head = nn.Linear(dim, patch ** 3 * X0_CH)
+        nn.init.zeros_(self.ada_f[1].weight)
+        nn.init.zeros_(self.ada_f[1].bias)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+        self._pos_cache: dict = {}
+
+    def _pos(self, dp, hp, wp, device):
+        key = (dp, hp, wp)
+        pe = self._pos_cache.get(key)
+        if pe is None or pe.device != device:
+            pe = posemb_3d(self.dim, dp, hp, wp, device)
+            self._pos_cache[key] = pe
+        return pe
 
     def forward(self, x, t, cond, theme, attr, attr_mask=None, version=None):
-        """Forward pass.
+        """Predict v for a noised voxel grid.
 
         Args:
             x:         Noised voxel grid, shape (B, 4, D, H, W).
@@ -127,32 +179,50 @@ class UNet3D(nn.Module):
             theme:     Theme indices, shape (B,).
             attr:      Shape attribute vector, shape (B, 3), values in [0, 1].
             attr_mask: Binary mask, shape (B,). 1 = use attr conditioning,
-                       0 = use unconditional null token (CFG training).
-            version:   Accepted for backward compat, ignored (single-version model).
+                       0 = use the unconditional null token (CFG training).
+            version:   QR version indices, shape (B,). Optional — omit for
+                       single-version models.
         """
-        temb = self.tmlp(timestep_embedding(t, self.ch)) + self.theme_emb(theme)
+        B, _, D, H, W = x.shape
+        p = self.patch
+        assert D % p == 0 and H % p == 0 and W % p == 0, \
+            f"grid ({D},{H},{W}) must be a multiple of patch={p}"
+
+        c = self.tmlp(timestep_embedding(t, 256)) + self.theme_emb(theme)
         attr_emb = self.attr_mlp(attr)
         if attr_mask is not None:
             m = attr_mask.view(-1, 1).float()
             attr_emb = m * attr_emb + (1.0 - m) * self.attr_null
-        temb = temb + attr_emb
+        c = c + attr_emb
+        if version is not None:
+            if not torch.is_tensor(version):
+                version = torch.full((B,), int(version), device=x.device)
+            modules = version.float() * 4.0 + 17.0        # QR modules per side
+            c = c + self.ver_mlp(timestep_embedding(modules, 256))
 
-        # encoder + bottleneck + decoder
-        h1 = self.d1(self.in_conv(torch.cat([x, cond], dim=1)), temb)
-        h2 = self.d2(self.down1(h1), temb)
-        h3 = self.d3(self.down2(h2), temb)
-        h = self.m2(self.m1(h3, temb), temb)
-        h = self.up2(h)
-        h = self.u2(torch.cat([h, h2], 1), temb)
-        h = self.up1(h)                                # (B, 2ch, D, H, W)
-        u1_in = torch.cat([h, h1], 1)                  # (B, 3ch, D, H, W)
+        h = self.patch_embed(torch.cat([x, cond], dim=1))        # (B, dim, D', H', W')
+        dp, hp, wp = h.shape[2], h.shape[3], h.shape[4]
+        h = h.flatten(2).transpose(1, 2)                          # (B, L, dim)
+        h = h + self._pos(dp, hp, wp, h.device).to(h.dtype)[None]
 
-        # head (single)
-        h = self.head_u1(u1_in, temb)
-        out = self.head_conv(F.silu(self.head_norm(h)))
-        return out
+        for blk in self.blocks:
+            if self.grad_checkpoint and self.training:
+                h = torch.utils.checkpoint.checkpoint(blk, h, c, use_reentrant=False)
+            else:
+                h = blk(h, c)
+
+        sh, sc = self.ada_f(c)[:, None, :].chunk(2, dim=-1)
+        h = self.head(self.norm_f(h) * (1 + sc) + sh)             # (B, L, p³·4)
+
+        # Unpatchify: (B, L, p³·C) → (B, C, D, H, W)
+        h = h.reshape(B, dp, hp, wp, p, p, p, X0_CH)
+        h = h.permute(0, 7, 1, 4, 2, 5, 3, 6)
+        return h.reshape(B, X0_CH, D, H, W)
 
 
+# ---------------------------------------------------------------------------
+# Diffusion process
+# ---------------------------------------------------------------------------
 class Diffusion:
     """V-prediction denoising diffusion over the 4-channel voxel grid.
 
@@ -175,33 +245,8 @@ class Diffusion:
         self.betas = cosine_beta_schedule(T).to(device)
         self.alphas = 1.0 - self.betas
         self.acp = torch.cumprod(self.alphas, 0)
-        self.acp_prev = torch.cat([torch.ones(1, device=device), self.acp[:-1]])
         self.sqrt_acp = self.acp.sqrt()
         self.sqrt_one_minus_acp = (1.0 - self.acp).sqrt()
-
-        # Note: a Z-axis void prior used to live here, but with variable-Z
-        # training the Z extent depends on the QR version per sample. The
-        # mask isn't applied anywhere in the current loss anyway, so we drop
-        # it. Per-sample Z bounds are handled by the dataset (voxels are
-        # never written outside the grid, and the QR-footprint mask in
-        # sample() zeroes out non-occupied columns).
-
-        # Rotation matrices for 17-view multi-view silhouette loss
-        # (8 side views + 8 tilted views + 1 top-down view).
-        azim_list = [0, 45, 90, 135, 180, 225, 270, 315]
-        view_configs = [(az, 0) for az in azim_list] + \
-                       [(az, 45) for az in azim_list] + [(0, 90)]
-        mats = []
-        for (az_deg, el_std_deg) in view_configs:
-            a = math.radians(az_deg)
-            tilt = math.radians(90 - el_std_deg)
-            ca, sa = math.cos(a), math.sin(a)
-            ce, se = math.cos(tilt), math.sin(tilt)
-            R_az = torch.tensor([[ca, -sa, 0.0], [sa, ca, 0.0], [0.0, 0.0, 1.0]])
-            R_el = torch.tensor([[1.0, 0.0, 0.0], [0.0, ce, -se], [0.0, se, ce]])
-            R = R_el @ R_az
-            mats.append(torch.cat([R, torch.zeros(3, 1)], dim=1))
-        self.view_mats = torch.stack(mats, dim=0).to(device)     # (17, 3, 4)
 
     def q_sample(self, x0, t, noise):
         a = self.sqrt_acp[t][:, None, None, None, None]
@@ -232,11 +277,10 @@ class Diffusion:
         Loss is **masked to columns under a dark QR module** (`cond > 0.5`).
         Outside the mask the target is trivially "empty everywhere" (the QR
         footprint mask in `sample()` zeros those columns anyway), so
-        including them in the loss only dilutes the gradient — and worse,
-        the *amount* of dilution scales with how much zero-padding a sample
-        carries from the mixed-version `pad_collate`. With the mask, every
-        sample contributes gradient proportional to its own real-voxel count
-        regardless of which other versions share its batch.
+        including them in the loss only dilutes the gradient. Per-sample
+        normalization keeps every sample's contribution equal regardless of
+        its grid size, so the version sampler's intent (e.g. 40% v2)
+        actually translates into 40% of the gradient signal.
 
         Args:
             model:     The denoising network.
@@ -246,6 +290,7 @@ class Diffusion:
             attr:      Shape attribute vector, shape (B, 3).
             attr_drop: Probability of dropping the attribute condition to the
                        null token, enabling classifier-free guidance at inference.
+            version:   QR version indices, shape (B,), or None.
         """
         t = torch.randint(0, self.T, (x0.size(0),), device=x0.device)
         noise = torch.randn_like(x0)
@@ -255,38 +300,24 @@ class Diffusion:
         v_pred = model(x_t, t, cond, theme, attr, attr_mask, version)   # (B, 4, D, H, W)
         v_tgt = self.v_target(x0, t, noise)
 
-        # Footprint mask: columns above DARK QR modules. Same shape as v_pred
-        # after channel broadcast. Clamp denom to avoid zero-division.
-        # PER-SAMPLE normalization: each sample's loss is normalized by its
-        # own voxel count BEFORE averaging across the batch. Otherwise the
-        # batch-wide sum-then-divide weights samples by voxel count, which
-        # makes large-grid versions (v5: ~96k voxels) drown out small ones
-        # (v2: ~31k voxels) regardless of the sampling distribution. With
-        # per-sample normalization, every sample contributes equally — the
-        # weighted sampler's intent (e.g. 33% v2) actually translates into
-        # 33% of the gradient signal.
         m = (cond > 0.5).float()                                # (B, 1, D, H, W)
-        m_full = m.expand_as(v_pred)                            # (B, 4, D, H, W)
         sq = (v_pred - v_tgt) ** 2
 
         # Per-voxel occupancy pos_weight: up-weight occupied voxels to prevent
         # sparse-occupancy collapse (e.g. palm/socotra where ~3% of the footprint
         # is occupied). w = N_empty / N_occupied, capped at 12× to avoid
         # over-aggressive gradients for very sparse themes.
-        # Applied only to the occupancy channel (ch 3); RGB (ch 0-2) unchanged.
         #
         # NOTE: pos_w must be a PER-VOXEL weight map, not a per-sample scalar.
         # A per-sample scalar cancels algebraically in the normalised loss:
         #   (sq * m * s).sum() / (m * s).sum()  ==  (sq * m).sum() / m.sum()
-        # To actually up-weight occupied voxels we build a spatial weight map
-        # where occupied voxels get pos_w and empty (but in-footprint) voxels
-        # get 1.0, so the ratio between them is preserved after normalisation.
+        # The spatial weight map keeps the occupied/empty ratio after
+        # normalisation: occupied voxels get pos_w, empty (in-footprint) 1.0.
         occ_gt = (x0[:, 3:4] > 0).float() * m            # occupied & in footprint
         n_occ  = occ_gt.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
         n_foot = m.sum(dim=[1, 2, 3, 4]).clamp(min=1.0)
         pos_w  = ((n_foot - n_occ) / n_occ).clamp(max=12.0)   # (B,) scalar ratio
         pos_w  = pos_w.view(-1, 1, 1, 1, 1)                   # broadcast-ready
-        # Spatial weight map: occ voxels → pos_w, empty-in-footprint → 1.0
         vox_w  = occ_gt * pos_w + (1.0 - occ_gt) * m          # (B, 1, D, H, W)
 
         # RGB loss (ch 0-2): ~90% of footprint voxels are empty (black), so an
@@ -309,12 +340,10 @@ class Diffusion:
         per_sample = (v_rgb_ps + v_occ_ps) / 4.0   # /4 keeps scale ≈ original
         L = per_sample.mean()
 
-        v_rgb = v_rgb_ps.mean().detach()
-        v_occ = v_occ_ps.mean().detach()
         return L, {
             "v_mse": L.detach(),
-            "v_rgb": v_rgb,
-            "v_occ": v_occ,
+            "v_rgb": v_rgb_ps.mean().detach(),
+            "v_occ": v_occ_ps.mean().detach(),
         }
 
     @torch.no_grad()
@@ -335,6 +364,7 @@ class Diffusion:
                     sampling; eta=0 gives deterministic DDIM.
             cfg:    Classifier-free guidance scale for the attribute signal.
                     1.0 disables guidance; values > 1 amplify attribute influence.
+            version: QR version indices, shape (B,), or None.
 
         Returns:
             Sampled voxel grid, shape (B, 4, D, H, W), with the QR footprint

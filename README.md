@@ -46,21 +46,29 @@ Training data is produced by a procedural voxel-tree generator, so the dataset
 is effectively infinite and is generated on the fly during training — no data
 files are stored on disk.
 
-One UNet3D model is trained per QR version (v2..v5). A single shared model
-across QR sizes underperformed because the receptive-field-to-grid ratio
-changes with version; splitting one model per version lets each specialize.
+One model covers all trained QR versions (v2..v5): the QR version enters the
+network as conditioning, batches are bucketed so each batch holds a single
+grid size, and the positional embeddings are computed from the input size.
 
 ## How it works
 
-The model is a 3D U-Net trained with **v-prediction**: the network predicts the
-diffusion `v` target rather than the clean sample or the noise directly.
-Combined with stochastic (ancestral) sampling, this lets per-voxel color be
-drawn from a distribution instead of regressed toward a mean — important
-because foliage color is inherently varied, and a deterministic regressor
-collapses it to a single dull average.
+The denoiser is a **diffusion transformer** (DiT): the voxel grid is split
+into 4×4×4 patches, processed by transformer blocks with adaLN-Zero
+conditioning, and projected back to voxels. Every block runs full global
+attention, so the receptive field spans the entire grid at every layer and
+every QR version — the property that lets one model serve all sizes.
+
+It is trained with **v-prediction**: the network predicts the diffusion `v`
+target rather than the clean sample or the noise directly. Combined with
+stochastic (ancestral) sampling, this lets per-voxel color be drawn from a
+distribution instead of regressed toward a mean — important because foliage
+color is inherently varied, and a deterministic regressor collapses it to a
+single dull average.
 
 The shape attributes are trained with **classifier-free guidance**, so a user
-can push the generator toward taller, fuller, or wider trees at sampling time.
+can push the generator toward taller, fuller, or wider trees at sampling
+time. At inference, every surface conditions on measured per-species mean
+attributes, so each species is generated at its typical proportions.
 
 ## Repository layout
 
@@ -69,10 +77,11 @@ qrbloom/
   treegen.py     Procedural voxel-tree generator (10 species, per-species
                  augmentation built in)
   qr.py          QR-code generation and voxel-grid sizing helpers
-  diffusion.py   v-prediction 3D U-Net and the diffusion process
-train.py         Training entry point (one model per QR version)
+  model.py       DiT3D backbone + v-prediction diffusion process
+train.py         Training entry point (one model, all QR versions)
 evaluate.py      Quantitative evaluation (occupancy, color fidelity, diversity)
 gallery.py       Interactive 3D web viewer (FastAPI)
+scripts/         Weight export for the in-browser demo
 Makefile         Task shortcuts (train, stop, gallery, status, logs, clean)
 assets/          Demo assets
 ```
@@ -89,20 +98,18 @@ Requires Python 3.10+ and a CUDA-capable GPU for training.
 
 ### Training
 
-The simplest way is the Makefile, which trains one model per QR version on a
-separate GPU and writes per-version checkpoints / logs:
+The simplest way is the Makefile, which launches one multi-version training
+run in the background and resumes from the latest checkpoint:
 
 ```bash
-make train           # launch v2..v5 in parallel
-make train-v2        # one specific version
-make status          # GPU usage + live trainings + latest val_total
-make stop            # kill all trainings
-make logs-v2         # tail -f a single training's log
+make train           # train v2..v5 in one model (resumes if possible)
+make status          # GPU usage + latest per-version val metrics
+make stop            # kill the training
+make logs            # tail -f the training log
 ```
 
-GPU assignment, BATCH size, and other knobs are Make variables — override at
-the command line, e.g. `V2_GPU=0 V2_BATCH=64 EPOCHS=500 make train-v2`.
-See `make help` for the full list.
+BATCH size and other knobs are Make variables — override at the command
+line, e.g. `BATCH=32 EPOCHS=500 make train`. See `make help` for the list.
 
 If you'd rather drive `train.py` directly, every setting is also an
 environment variable. Important ones:
@@ -111,30 +118,33 @@ environment variable. Important ones:
 |----------------------|----------|----------------------------------------|
 | `VARIANT`            | `""`     | Suffix for checkpoints/runs dirs       |
 | `QR_VERSIONS`        | `2,3,4,5`| Which QR versions to sample from       |
+| `QR_VERSION_WEIGHTS` | tilted   | Per-version sampling weights           |
 | `EPOCHS`             | `80`     | Number of training epochs              |
 | `BATCH`              | `42`     | Per-GPU batch size                     |
 | `LR`                 | `2e-4`   | Base learning rate                     |
 | `T`                  | `500`    | Diffusion timesteps                    |
 | `EPOCH_SIZE`         | `100000` | Live-generated samples per epoch       |
 | `SAMPLE_STEPS`       | `100`    | Sampling steps for epoch previews      |
+| `INIT_FROM`          | `""`     | Warm-start checkpoint (non-strict)     |
+| `MONT_VERSION`       | random   | Pin the montage QR version             |
 
-Single-version training writes:
+Training writes:
 - `checkpoints/qrbloom{VARIANT}.pt` — latest checkpoint
 - `checkpoints/qrbloom{VARIANT}_best.pt` — best validation loss
 - `runs{VARIANT}/epoch_{N}.json|.png` — per-epoch previews
 
-For example, training v2 with `VARIANT=_v2` produces `qrbloom_v2.pt`,
-`qrbloom_v2_best.pt`, and `runs_v2/`.
+The Makefile uses `VARIANT=_all`, producing `qrbloom_all.pt`,
+`qrbloom_all_best.pt`, and `runs_all/`.
 
 ### Evaluation
 
 ```bash
-python evaluate.py --checkpoint checkpoints/qrbloom_v2_best.pt
+python evaluate.py --checkpoint checkpoints/qrbloom_all_best.pt
 ```
 
-This samples trees from held-out QR codes and reports occupancy IoU against
-the procedural ground truth, color-palette fidelity, per-tree color diversity,
-and sample-to-sample diversity for a fixed QR code.
+This samples trees from held-out QR codes at every trained version and
+reports occupancy IoU against the procedural ground truth, color-palette
+fidelity, per-tree color diversity, and sample-to-sample diversity.
 
 ### Interactive gallery
 
@@ -213,8 +223,8 @@ edits are visible from the host:
 ```bash
 docker run --rm --gpus all \
     -v "$(pwd):/app" \
-    -e VARIANT=_v2 -e QR_VERSIONS=2 -e QR_VERSION_WEIGHTS=1.0 \
-    -e BATCH=128 -e EPOCH_SIZE=80000 -e EPOCHS=300 \
+    -e VARIANT=_all -e QR_VERSIONS=2,3,4,5 \
+    -e BATCH=18 -e EPOCH_SIZE=40000 -e EPOCHS=300 \
     ghcr.io/rocknroll17/qr-bloom:latest \
     python train.py
 ```

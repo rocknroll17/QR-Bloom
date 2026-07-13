@@ -27,8 +27,7 @@ sys.path.insert(0, ".")
 import numpy as np
 import torch
 
-from qrbloom.diffusion import Diffusion, X0_CH, N_THEMES
-from qrbloom.dit import DiT3D
+from qrbloom.model import DiT3D, Diffusion, X0_CH, N_THEMES
 from qrbloom.qr import grid_xy_for_version, grid_z_for_version
 from qrbloom.treegen import LABELS, THEMES, attr_means
 

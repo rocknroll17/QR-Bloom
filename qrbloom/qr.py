@@ -11,8 +11,8 @@ QR module count per side = 4 * version + 17 (ISO/IEC 18004).
 Voxel grid for version v:
   grid_xy(v) = ceil(qr_modules(v) / 4) * 4
   grid_z(v)  = ceil(32 * scale(v)  / 4) * 4    # scale(v) = qr_modules(v)/21
-The U-Net is fully convolutional in all three spatial dims, so a single model
-handles any version whose (XY, Z) are multiples of XY_MULTIPLE.
+The DiT computes positional embeddings from the input size, so a single
+model handles any version whose (XY, Z) are multiples of XY_MULTIPLE.
 """
 import string
 
@@ -25,7 +25,7 @@ from qrbloom.treegen import THEMES
 # Version-aware constants
 # ---------------------------------------------------------------------------
 BASE_Z_AT_V1 = 32       # Z extent of the v1 grid; higher versions scale up
-XY_MULTIPLE = 4         # U-Net has 2 downsampling stages -> XY/Z must be multiple of 4
+XY_MULTIPLE = 4         # DiT patch size -> XY/Z must be multiples of 4
 Z_MULTIPLE = 4
 MIN_VERSION = 1
 MAX_VERSION = 40
@@ -73,13 +73,6 @@ def grid_shape_for_version(version: int) -> tuple[int, int, int]:
     xy = grid_xy_for_version(version)
     z = grid_z_for_version(version)
     return (xy, xy, z)
-
-
-# QR_OFFSET: kept for evaluate.py which still imports it.
-# (Other v1 aliases — QR_VERSION, QR_SIZE, GRID, QR_CENTER — were removed
-# along with pad32; new code should call grid_xy_for_version()/pad_to_grid()
-# directly with an explicit version.)
-QR_OFFSET = (grid_xy_for_version(1) - qr_modules(1)) // 2
 
 
 # Approximate alphanumeric capacity at error level M (segno will reject if too
@@ -146,8 +139,3 @@ def random_qr(rng, version: int = DEFAULT_VERSION) -> np.ndarray:
     core = random_qr_core(rng, version=version)
     full, _ = pad_to_grid(core)
     return full
-
-
-# ---------------------------------------------------------------------------
-# Legacy helper — preserved for external scripts (evaluate.py, gallery.py)
-# ---------------------------------------------------------------------------

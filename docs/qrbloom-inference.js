@@ -272,7 +272,7 @@ function encodeQR(text, trainedVersions) {
 // --- cosine β schedule + per-step constants --------------------------------
 
 function buildSchedule() {
-  // Matches qrbloom/diffusion.py:cosine_beta_schedule (T=500, s=0.008).
+  // Matches qrbloom/model.py:cosine_beta_schedule (T=500, s=0.008).
   const T = T_TOTAL;
   const acp = new Float32Array(T);
   const sqrt_acp = new Float32Array(T);

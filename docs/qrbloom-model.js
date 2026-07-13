@@ -1,4 +1,4 @@
-// DiT3D (qrbloom/dit.py) ported to TensorFlow.js.
+// DiT3D (qrbloom/model.py) ported to TensorFlow.js.
 //
 // One net serves every trained QR version: the grid-dependent pieces
 // (patchify/unpatchify index maps, positional embeddings) are built per
@@ -26,7 +26,7 @@ export function makeQRBloom(tf, manifest, weightsBuf) {
   const CIN = 5, C_OUT = 4;
   const HAS_VER = 'ver_mlp.0.weight' in P;
 
-  // --- 3D sin-cos positional embedding (matches qrbloom.dit.posemb_3d) ----
+  // --- 3D sin-cos positional embedding (matches qrbloom.model.posemb_3d) --
   function posemb1d(dim, n) {
     const half = dim / 2, out = new Float32Array(n * dim);
     for (let i = 0; i < half; i++) {

@@ -3,19 +3,21 @@
 
 """QR-Bloom training script.
 
-Trains a QR-conditioned 3D voxel tree diffusion model using v-prediction.
-Training data is generated on-the-fly: each sample is a procedurally grown
-voxel tree placed inside a QR footprint. The voxel grid size depends on the
-QR version (see qrbloom.qr.grid_shape_for_version). The model learns to
-denoise a 4-channel (RGB + occupancy) voxel grid conditioned on the QR
-footprint, a tree-species theme index, and three shape attributes.
+Trains the QR-conditioned voxel tree diffusion model (one DiT3D across all
+QR versions) using v-prediction. Training data is generated on-the-fly:
+each sample is a procedurally grown voxel tree placed inside a QR
+footprint. The voxel grid size depends on the QR version (see
+qrbloom.qr.grid_shape_for_version); batches are bucketed so each batch
+holds a single version. The model learns to denoise a 4-channel
+(RGB + occupancy) voxel grid conditioned on the QR footprint, a
+tree-species theme index, three shape attributes, and the QR version.
 
-Losses (see qrbloom/diffusion.py p_losses):
+Losses (see qrbloom/model.py p_losses):
   v_mse : v-prediction MSE over all 4 channels
   v_rgb : v-prediction MSE restricted to the RGB channels
   v_occ : v-prediction MSE restricted to the occupancy channel
 
-Outputs (with `VARIANT` env var suffix, e.g. VARIANT=_v2):
+Outputs (with `VARIANT` env var suffix, e.g. VARIANT=_all):
   checkpoints/qrbloom{VARIANT}.pt       — latest checkpoint
   checkpoints/qrbloom{VARIANT}_best.pt  — best validation checkpoint
   runs{VARIANT}/epoch_{N:03d}.png       — per-epoch sample montage
@@ -24,9 +26,7 @@ Outputs (with `VARIANT` env var suffix, e.g. VARIANT=_v2):
 """
 from __future__ import annotations
 
-import json
 import os
-import time
 from pathlib import Path
 
 import numpy as np
@@ -37,8 +37,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from qrbloom.diffusion import Diffusion, EMA, DOWNSCALE
-from qrbloom.dit import DiT3D
+from qrbloom.model import DiT3D, Diffusion, EMA, DOWNSCALE
 from qrbloom.qr import (THEME_NAMES as DS_THEMES, random_qr_core,
                         qr_modules, grid_xy_for_version,
                         grid_z_for_version, pad_to_grid)
@@ -303,8 +302,10 @@ def pad_collate(batch):
         # (D, H, W) — pad W (Z) one-sided, D/H symmetric.
         D, H, W = t.shape
         pz = max_z - W
-        pad_d_l = (max_xy - D) // 2; pad_d_r = (max_xy - D) - pad_d_l
-        pad_h_l = (max_xy - H) // 2; pad_h_r = (max_xy - H) - pad_h_l
+        pad_d_l = (max_xy - D) // 2
+        pad_d_r = (max_xy - D) - pad_d_l
+        pad_h_l = (max_xy - H) // 2
+        pad_h_r = (max_xy - H) - pad_h_l
         # F.pad order for 3D tensor: (W_l, W_r, H_l, H_r, D_l, D_r)
         return F.pad(t, (0, pz, pad_h_l, pad_h_r, pad_d_l, pad_d_r))
 
@@ -312,15 +313,19 @@ def pad_collate(batch):
         # (C, D, H, W)
         _, D, H, W = t.shape
         pz = max_z - W
-        pad_d_l = (max_xy - D) // 2; pad_d_r = (max_xy - D) - pad_d_l
-        pad_h_l = (max_xy - H) // 2; pad_h_r = (max_xy - H) - pad_h_l
+        pad_d_l = (max_xy - D) // 2
+        pad_d_r = (max_xy - D) - pad_d_l
+        pad_h_l = (max_xy - H) // 2
+        pad_h_r = (max_xy - H) - pad_h_l
         return F.pad(t, (0, pz, pad_h_l, pad_h_r, pad_d_l, pad_d_r))
 
     def _pad_qr(t: torch.Tensor) -> torch.Tensor:
         # (D, H)
         D, H = t.shape
-        pad_d_l = (max_xy - D) // 2; pad_d_r = (max_xy - D) - pad_d_l
-        pad_h_l = (max_xy - H) // 2; pad_h_r = (max_xy - H) - pad_h_l
+        pad_d_l = (max_xy - D) // 2
+        pad_d_r = (max_xy - D) - pad_d_l
+        pad_h_l = (max_xy - H) // 2
+        pad_h_r = (max_xy - H) - pad_h_l
         return F.pad(t, (pad_h_l, pad_h_r, pad_d_l, pad_d_r))
 
     occ_b = torch.stack([_pad_occ(o) for o in occs], 0)
@@ -360,14 +365,19 @@ def render_montage(occ_bin: np.ndarray, rgb: np.ndarray, qrs: np.ndarray,
         if rs.size:
             cols_rgb = (np.transpose(rgb[i], (1, 2, 3, 0))[rs, cs, hs] * 0.5 + 0.5).clip(0, 1)
             ax.scatter(cs, rs, hs, c=cols_rgb, s=8, marker="s", depthshade=False)
-        ax.set_xlim(0, D); ax.set_ylim(0, H); ax.set_zlim(0, W)
+        ax.set_xlim(0, D)
+        ax.set_ylim(0, H)
+        ax.set_zlim(0, W)
         ax.set_box_aspect((1, 1, 1))
-        ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_zticks([])
         ax.set_title(f"{THEMES[themes[i]]}\nn={occ_bin[i].sum()}", fontsize=7)
         ax2 = fig.add_subplot(2, B, B + i + 1)
         top = occ_bin[i].max(axis=2)
         ax2.imshow(np.stack([qrs[i], top, np.zeros_like(top)], axis=-1) * 0.7 + 0.1)
-        ax2.set_xticks([]); ax2.set_yticks([])
+        ax2.set_xticks([])
+        ax2.set_yticks([])
         ax2.set_title("R=QR  G=pred top", fontsize=7)
     plt.tight_layout()
     plt.savefig(path, dpi=110)
@@ -529,7 +539,9 @@ def save_loss_curve(hist, path):
     ax.plot(epochs, [h["val_total"] for h in hist], label="val_total", lw=1.2)
     ax.plot(epochs, [h["train"]["v_rgb"] for h in hist], label="v_rgb", alpha=0.6)
     ax.plot(epochs, [h["train"]["v_occ"] for h in hist], label="v_occ", alpha=0.6)
-    ax.set_xlabel("epoch"); ax.set_ylabel("loss"); ax.grid(alpha=0.3)
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.grid(alpha=0.3)
     ax.legend(loc="upper right")
     fig.tight_layout()
     fig.savefig(path, dpi=100)
@@ -616,7 +628,8 @@ def main():
     mont_batch = None
     mont_version = None
     if IS_MAIN:
-        import segno, random
+        import segno
+        import random
         import string
         rng = random.Random(20260520)
         url_chars = string.ascii_lowercase + string.digits + "-."
@@ -649,7 +662,8 @@ def main():
                         else:
                             text = "".join(rng.choices(url_chars, k=n))
                     try:
-                        segno.make(text, error="m", version=mont_version); break
+                        segno.make(text, error="m", version=mont_version)
+                        break
                     except Exception:
                         continue
             qr = segno.make(text, error="m", version=mont_version)
@@ -657,7 +671,8 @@ def main():
                             dtype=np.uint8)
             pad = np.zeros((m_gxy, m_gxy), dtype=np.uint8)
             pad[m_off:m_off + m_qe, m_off:m_off + m_qe] = core
-            unseen_qrs.append(pad); unseen_texts.append(text)
+            unseen_qrs.append(pad)
+            unseen_texts.append(text)
         unseen_qrs = np.stack(unseen_qrs)
         mont_batch = (
             torch.zeros(9, m_gxy, m_gxy, m_gz, dtype=torch.uint8),
@@ -760,7 +775,8 @@ def main():
         n_batches = 0
         for occ_b, rgb_b, qr_b, th_b, attr_b, ver_b in pbar:
             lr = lr_at(cur_step, total_steps)
-            for pg in opt.param_groups: pg["lr"] = lr
+            for pg in opt.param_groups:
+                pg["lr"] = lr
 
             x0, cond = _normalize_batch(occ_b, rgb_b, qr_b, DEVICE)
             theme = th_b.to(DEVICE, non_blocking=True)
@@ -784,14 +800,16 @@ def main():
             cur_step += 1
             n_batches += 1
 
-            for k, v in info.items(): epoch_parts[k] += v.item()
+            for k, v in info.items():
+                epoch_parts[k] += v.item()
             epoch_parts["total"] += loss.item()
             if IS_MAIN and n_batches % 10 == 0:
                 pbar.set_postfix(loss=f"{loss.item():.3f}",
                                  v_rgb=f"{info['v_rgb'].item():.3f}",
                                  v_occ=f"{info['v_occ'].item():.3f}")
 
-        for k in epoch_parts: epoch_parts[k] /= max(n_batches, 1)
+        for k in epoch_parts:
+            epoch_parts[k] /= max(n_batches, 1)
         if IS_DIST:
             keys = LOSS_KEYS + ("total",)
             buf = torch.tensor([epoch_parts[k] for k in keys],

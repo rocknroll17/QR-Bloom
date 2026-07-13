@@ -9,10 +9,10 @@
 # Run the gallery with GPU inference (requires nvidia-container-toolkit):
 #   docker run -d --gpus all -p 8000:8000 -v "$(pwd):/app" --name qrbloom-gallery qrbloom
 #
-# Train one QR version (one model per version is the design):
+# Train (one DiT3D model across all QR versions):
 #   docker run --rm --gpus all -v "$(pwd):/app" \
-#       -e VARIANT=_v2 -e QR_VERSIONS=2 -e QR_VERSION_WEIGHTS=1.0 \
-#       -e BATCH=128 -e EPOCH_SIZE=80000 -e EPOCHS=300 \
+#       -e VARIANT=_all -e QR_VERSIONS=2,3,4,5 \
+#       -e BATCH=18 -e EPOCH_SIZE=40000 -e EPOCHS=300 \
 #       qrbloom python train.py
 #
 # Override the host port (gallery listens on whatever --port is passed):
