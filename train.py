@@ -38,7 +38,8 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from qrbloom.diffusion import UNet3D, Diffusion, EMA, DOWNSCALE
+from qrbloom.diffusion import Diffusion, EMA, DOWNSCALE
+from qrbloom.dit import DiT3D
 from qrbloom.qr import (THEME_NAMES as DS_THEMES, random_qr_core,
                         qr_modules, grid_xy_for_version,
                         grid_z_for_version, pad_to_grid)
@@ -79,10 +80,18 @@ VAL_SIZE = int(os.environ.get("VAL_SIZE", "2400"))         # fixed validation se
 VARIANT = os.environ.get("VARIANT", "")
 SUFFIX = VARIANT
 
+# ── DiT backbone hyperparameters ──────────────────────────────────────────────
+DIT_DIM = int(os.environ.get("DIT_DIM", "384"))
+DIT_DEPTH = int(os.environ.get("DIT_DEPTH", "12"))
+DIT_HEADS = int(os.environ.get("DIT_HEADS", "6"))
+DIT_PATCH = int(os.environ.get("DIT_PATCH", "4"))
+DIT_CKPT = bool(int(os.environ.get("DIT_CKPT", "0")))  # gradient checkpointing
+
 # Multi-version training: pick a QR version per sample from this set. The
-# diffusion model is fully convolutional in XY, so a single set of weights
-# handles all versions. To bound memory, training defaults to v1..v5
-# (XY up to 40). Set QR_VERSIONS="1,2,3,5,10" to widen the range.
+# DiT backbone builds its positional embeddings from the input size, so a
+# single set of weights handles any grid whose dims are multiples of the
+# patch size. To bound memory, training defaults to v1..v5 (XY up to 40).
+# Set QR_VERSIONS="1,2,3,5,10" to widen the range.
 def _parse_versions(s: str) -> list[int]:
     out = []
     for tok in s.split(","):
@@ -453,7 +462,8 @@ def save_loss_curve(hist, path):
 def sample_montage(diff, ema, mont_batch, mont_version, ep, png_path, device,
                    json_path=None):
     """Sample the EMA model stochastically for each theme and write PNG + JSON."""
-    m_eval = UNet3D(ch=48, n_themes=len(DS_THEMES), versions=tuple(QR_VERSIONS)).to(device)
+    m_eval = DiT3D(dim=DIT_DIM, depth=DIT_DEPTH, heads=DIT_HEADS,
+                   patch=DIT_PATCH, n_themes=len(DS_THEMES)).to(device)
     ema.copy_to(m_eval)
     m_eval.eval()
     occ_u8, rgb_u8, qr_u8, th = mont_batch
@@ -598,17 +608,17 @@ def main():
         log("[montage] saved ground-truth JSON")
 
     # ─── Model ────────────────────────────────────────────────────────────────
-    base_model = UNet3D(ch=48, n_themes=len(DS_THEMES), versions=tuple(QR_VERSIONS)).to(DEVICE)
+    base_model = DiT3D(dim=DIT_DIM, depth=DIT_DEPTH, heads=DIT_HEADS,
+                       patch=DIT_PATCH, n_themes=len(DS_THEMES),
+                       grad_checkpoint=DIT_CKPT).to(DEVICE)
     n_params = sum(p.numel() for p in base_model.parameters())
-    log(f"[model] UNet3D params={n_params/1e6:.2f}M")
+    log(f"[model] DiT3D params={n_params/1e6:.2f}M  "
+        f"dim={DIT_DIM} depth={DIT_DEPTH} heads={DIT_HEADS} patch={DIT_PATCH}")
     diff = Diffusion(T=T, device=DEVICE)
     ema = EMA(base_model, decay=0.999)
 
     if IS_DIST:
-        # MoE heads dispatch per-version: heads without samples on this step
-        # get no grad, so DDP must tolerate unused params.
-        model = DDP(base_model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK,
-                    find_unused_parameters=True)
+        model = DDP(base_model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
     else:
         model = base_model
 
