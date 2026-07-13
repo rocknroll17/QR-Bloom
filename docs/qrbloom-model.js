@@ -1,232 +1,175 @@
-// UNet3D + v-prediction diffusion, ported to TensorFlow.js (NDHWC layout).
-// Numerically matches the PyTorch reference (verified in verify_node.mjs).
-// Pass the tf module in (so the same code runs under tfjs-node and the browser
-// webgpu/wasm backends).
+// DiT3D (qrbloom/dit.py) ported to TensorFlow.js.
+//
+// The backbone is matmul/attention-only, so every tensor on the GPU is rank
+// ≤ 4 — well inside tf.js WebGPU's comfort zone (its conv3d and rank-5+
+// kernels are slow or broken). The two layout-heavy steps, patchify and
+// unpatchify, run in plain JS on the CPU: for a single sample they are just
+// ~300k float copies per forward, far below measurement noise.
+//
+// Pass the tf module in, so the same code runs under tfjs-node (verification)
+// and the browser webgpu/wasm backends.
 
 export function makeQRBloom(tf, manifest, weightsBuf) {
   const P = {};                      // name -> tf.tensor
   const f32 = new Float32Array(weightsBuf);
   for (const r of manifest.params) {
-    const slice = f32.slice(r.offset, r.offset + r.count); // typed copy, no Array.from
+    const slice = f32.slice(r.offset, r.offset + r.count);
     P[r.name] = tf.tensor(slice, r.shape, 'float32');
   }
-  const CH = manifest.ch, TDIM = manifest.tdim, EPS = 1e-5;
+  const DIM = manifest.dim, DEPTH = manifest.depth, HEADS = manifest.heads;
+  const PS = manifest.patch, HD = DIM / HEADS;
+  const [GX, , GZ] = manifest.grid;
+  const dp = GX / PS, hp = GX / PS, wp = GZ / PS;
+  const L = dp * hp * wp;
+  const CIN = 5, PV = CIN * PS * PS * PS;    // token vector length
+  const C_OUT = 4, TV = PS * PS * PS * C_OUT;
 
-  // --- helpers ----------------------------------------------------------
-  const silu = (x) => tf.mul(x, tf.sigmoid(x));
-
-  // tf.js WebGPU's conv3d/conv3dTranspose kernels are ~8x slower than conv2d
-  // (measured). So every 3D conv is run as a stack of 2D convs over depth
-  // slices (depth as batch) + a depth assembly. Numerically identical to the
-  // 3D conv (verified vs PyTorch), but uses the fast conv2d kernels.
-
-  // pad axes H,W (4D NHWC) by p via concat (4D pad -> vec4, WGSL-safe).
-  function padHW(x, p) {
-    if (p <= 0) return x;
-    for (const ax of [1, 2]) {
-      const zs = x.shape.slice(); zs[ax] = p;
-      x = tf.concat([tf.zeros(zs), x, tf.zeros(zs)], ax);
-    }
-    return x;
+  // --- CPU patchify / unpatchify index maps (built once per net) ----------
+  // Token order is D-major (di, hi, wi), matching x.flatten(2) in PyTorch.
+  // Token vector layout: channel-major (c, a, b, cc) — matches the exported
+  // patch_embed matrix. Output vector layout: (a, b, cc, C) — matches the
+  // reshape in DiT3D's unpatchify.
+  const gatherIdx = new Int32Array(L * PV);
+  {
+    let o = 0;
+    for (let di = 0; di < dp; di++) for (let hi = 0; hi < hp; hi++) for (let wi = 0; wi < wp; wi++)
+      for (let c = 0; c < CIN; c++)
+        for (let a = 0; a < PS; a++) for (let b = 0; b < PS; b++) for (let cc = 0; cc < PS; cc++)
+          gatherIdx[o++] = ((c * GX + di * PS + a) * GX + hi * PS + b) * GZ + wi * PS + cc;
+  }
+  const scatterIdx = new Int32Array(L * TV);
+  {
+    let o = 0;
+    for (let di = 0; di < dp; di++) for (let hi = 0; hi < hp; hi++) for (let wi = 0; wi < wp; wi++)
+      for (let a = 0; a < PS; a++) for (let b = 0; b < PS; b++) for (let cc = 0; cc < PS; cc++)
+        for (let c = 0; c < C_OUT; c++)
+          scatterIdx[o++] = ((c * GX + di * PS + a) * GX + hi * PS + b) * GZ + wi * PS + cc;
   }
 
-  // out[od] = sum_kd planes[kd][ idxOf(od,kd) ]  (out-of-range -> 0)
-  function assembleDepth(planes, Dout, idxOf) {
-    const Din = planes[0].shape[0];
-    let out = null;
-    for (let kd = 0; kd < planes.length; kd++) {
-      const idx = new Array(Dout); const mask = new Float32Array(Dout);
-      for (let od = 0; od < Dout; od++) {
-        const i = idxOf(od, kd); const ok = i >= 0 && i < Din;
-        idx[od] = ok ? i : 0; mask[od] = ok ? 1 : 0;
+  // --- 3D sin-cos positional embedding (matches qrbloom.dit.posemb_3d) ----
+  function posemb1d(dim, n) {
+    const half = dim / 2, out = new Float32Array(n * dim);
+    for (let i = 0; i < half; i++) {
+      const fr = Math.exp(-Math.log(10000.0) * i / half);
+      for (let p = 0; p < n; p++) {
+        out[p * dim + i] = Math.sin(p * fr);
+        out[p * dim + half + i] = Math.cos(p * fr);
       }
-      let g = tf.gather(planes[kd], idx, 0);              // [Dout,Ho,Wo,Cout]
-      g = tf.mul(g, tf.tensor(mask, [Dout, 1, 1, 1]));
-      out = out ? tf.add(out, g) : g;
     }
     return out;
   }
-
-  // Conv3d via conv2d depth-unroll. W layout [kD,kH,kW,Cin,Cout].
-  function conv3d(x, wname, bname, stride = 1, pad = 1) {
-    return tf.tidy(() => conv3dImpl(x, wname, bname, stride, pad));
-  }
-  function conv3dImpl(x, wname, bname, stride, pad) {
-    const W = P[wname];
-    const [kD, kH, kW2, Cin, Cout] = W.shape;
-    const [, D, H, Wd] = x.shape;
-    const xb = tf.reshape(x, [D, H, Wd, Cin]);            // depth -> batch
-    const planes = [];
-    for (let kd = 0; kd < kD; kd++) {
-      const W2 = tf.reshape(tf.slice(W, [kd,0,0,0,0], [1,kH,kW2,Cin,Cout]), [kH,kW2,Cin,Cout]);
-      let a;
-      if (stride === 1 && pad === ((kH - 1) >> 1)) a = tf.conv2d(xb, W2, 1, 'same');
-      else if (pad === 0)                          a = tf.conv2d(xb, W2, stride, 'valid');
-      else                                         a = tf.conv2d(padHW(xb, pad), W2, stride, 'valid');
-      planes.push(a);
+  const POS = (() => {
+    let ad = Math.floor(DIM / 3); ad -= ad % 2;
+    const aw = ad, ah = DIM - ad - aw;
+    const pd = posemb1d(ad, dp), ph = posemb1d(ah, hp), pw = posemb1d(aw, wp);
+    const out = new Float32Array(L * DIM);
+    let o = 0;
+    for (let di = 0; di < dp; di++) for (let hi = 0; hi < hp; hi++) for (let wi = 0; wi < wp; wi++) {
+      out.set(pd.subarray(di * ad, (di + 1) * ad), o); o += ad;
+      out.set(ph.subarray(hi * ah, (hi + 1) * ah), o); o += ah;
+      out.set(pw.subarray(wi * aw, (wi + 1) * aw), o); o += aw;
     }
-    const Dout = Math.floor((D + 2*pad - kD) / stride) + 1;
-    let out = assembleDepth(planes, Dout, (od, kd) => stride*od + kd - pad);
-    out = tf.reshape(out, [1, Dout, out.shape[1], out.shape[2], Cout]);
-    if (bname) out = tf.add(out, tf.reshape(P[bname], [1,1,1,1,-1]));
     return out;
-  }
+  })();
+  const posT = tf.tensor(POS, [1, L, DIM]);
 
-  // ConvTranspose3d (k4,s2,p1) via conv2dTranspose depth-unroll.
-  // W layout [kD,kH,kW,Cout,Cin]. outShape [1,Dout,Ho,Wo,Cout].
-  function convT3d(x, wname, bname, outShape) {
-    return tf.tidy(() => convT3dImpl(x, wname, bname, outShape));
-  }
-  function convT3dImpl(x, wname, bname, outShape) {
-    const W = P[wname];
-    const [kD, kH, kW2, Cout, Cin] = W.shape;
-    const [, D, H, Wd] = x.shape;
-    const Dout = outShape[1], Ho = outShape[2], Wo = outShape[3];
-    const xb = tf.reshape(x, [D, H, Wd, Cin]);
-    const planes = [];
-    for (let kd = 0; kd < kD; kd++) {
-      const W2 = tf.reshape(tf.slice(W, [kd,0,0,0,0], [1,kH,kW2,Cout,Cin]), [kH,kW2,Cout,Cin]);
-      planes.push(tf.conv2dTranspose(xb, W2, [D, Ho, Wo, Cout], 2, 'same')); // HW x2
-    }
-    // depth transpose-conv k4 s2 p1: od = 2*i + kd - 1  ->  i = (od-kd+1)/2
-    let out = assembleDepth(planes, Dout, (od, kd) => {
-      const n = od - kd + 1; return (n >= 0 && n % 2 === 0) ? n/2 : -1;
-    });
-    out = tf.reshape(out, [1, Dout, Ho, Wo, Cout]);
-    if (bname) out = tf.add(out, tf.reshape(P[bname], [1,1,1,1,-1]));
-    return out;
-  }
-
-  function groupNorm(x, wname, bname, groups = 8) {
-    const [b, d, hh, ww, c] = x.shape;
-    const g = groups, cg = c / g;
-    // rank-4 reshape [b, spatial, g, cg] — avoids rank-6 (which the WebGPU
-    // backend mishandles like the 5D Pad). Channels split as group*cg+within,
-    // matching torch GroupNorm.
-    let r = tf.reshape(x, [b, d*hh*ww, g, cg]);
-    const mom = tf.moments(r, [1,3], true);        // per (b,group)
-    r = tf.div(tf.sub(r, mom.mean), tf.sqrt(tf.add(mom.variance, EPS)));
-    r = tf.reshape(r, [b, d, hh, ww, c]);
-    const w = tf.reshape(P[wname], [1,1,1,1,c]);
-    const bi = tf.reshape(P[bname], [1,1,1,1,c]);
-    return tf.add(tf.mul(r, w), bi);
-  }
-
-  function linear(x, wname, bname) {            // weight pre-transposed to [in,out]
-    let h = tf.matMul(x, P[wname]);
-    if (bname) h = tf.add(h, P[bname]);
+  // --- tf helpers ----------------------------------------------------------
+  const silu = (x) => tf.mul(x, tf.sigmoid(x));
+  // GELU with tanh approximation — exact match for nn.GELU(approximate="tanh").
+  const gelu = (x) => tf.tidy(() => {
+    const inner = tf.mul(0.7978845608028654, tf.add(x, tf.mul(0.044715, tf.mul(x, tf.mul(x, x)))));
+    return tf.mul(tf.mul(x, 0.5), tf.add(1, tf.tanh(inner)));
+  });
+  const linear = (x, w, b) => {
+    let h = tf.matMul(x, P[w]);               // weights pre-transposed [in,out]
+    if (b) h = tf.add(h, P[b]);
     return h;
-  }
+  };
+  // LayerNorm over the last axis, no affine (eps matches PyTorch's 1e-6).
+  const layerNorm = (x) => tf.tidy(() => {
+    const m = tf.mean(x, -1, true);
+    const d = tf.sub(x, m);
+    const v = tf.mean(tf.mul(d, d), -1, true);
+    return tf.div(d, tf.sqrt(tf.add(v, 1e-6)));
+  });
 
   function timestepEmbedding(tVal, dim) {
-    const half = dim / 2;
-    const freqs = [];
-    for (let i = 0; i < half; i++) freqs.push(Math.exp(-Math.log(10000) * i / half));
-    const cos = freqs.map(fr => Math.cos(tVal * fr));
-    const sin = freqs.map(fr => Math.sin(tVal * fr));
-    return tf.tensor(cos.concat(sin), [1, dim]);  // [1, dim]
-  }
-
-  function resblock(x, temb, prefix, cin, cout) {
-    return tf.tidy(() => {
-      let h = conv3d(silu(groupNorm(x, `${prefix}.norm1.weight`, `${prefix}.norm1.bias`)),
-                     `${prefix}.conv1.weight`, `${prefix}.conv1.bias`);
-      const tp = linear(temb, `${prefix}.temb.weight`, `${prefix}.temb.bias`); // [1,cout]
-      h = tf.add(h, tf.reshape(tp, [1,1,1,1,cout]));
-      h = conv3d(silu(groupNorm(h, `${prefix}.norm2.weight`, `${prefix}.norm2.bias`)),
-                 `${prefix}.conv2.weight`, `${prefix}.conv2.bias`);
-      let sk = x;
-      if (cin !== cout) sk = conv3d(x, `${prefix}.skip.weight`, `${prefix}.skip.bias`, 1, 0);
-      return tf.add(h, sk);
-    });
-  }
-
-  // --- forward: x,cond NDHWC [1,D,H,W,C] ; t scalar; theme int; attr [3] ----
-  function forward(x, cond, tVal, themeIdx, attrArr, attrMask) {
-    return tf.tidy(() => {
-      // conditioning embedding
-      let temb = tf.add(linear(timestepEmbedding(tVal, CH), 'tmlp.0.weight','tmlp.0.bias'), 0);
-      temb = linear(silu(temb), 'tmlp.2.weight','tmlp.2.bias');
-      const themeRow = tf.reshape(tf.gather(P['theme_emb.weight'], [themeIdx]), [1, TDIM]);
-      temb = tf.add(temb, themeRow);
-      let attrEmb = linear(tf.tensor(attrArr, [1,3]), 'attr_mlp.0.weight','attr_mlp.0.bias');
-      attrEmb = linear(silu(attrEmb), 'attr_mlp.2.weight','attr_mlp.2.bias');
-      const m = attrMask;
-      const attrNull = tf.reshape(P['attr_null'], [1, TDIM]);
-      attrEmb = tf.add(tf.mul(attrEmb, m), tf.mul(attrNull, 1 - m));
-      temb = tf.add(temb, attrEmb);
-
-      const ch = CH;
-      const inp = tf.concat([x, cond], 4);                       // [1,D,H,W,5]
-      const h0 = conv3d(inp, 'in_conv.weight', 'in_conv.bias');  // ch
-      const h1 = resblock(h0, temb, 'd1', ch, ch);
-      const d1 = conv3d(h1, 'down1.weight', 'down1.bias', 2, 1); // ch, /2
-      const h2 = resblock(d1, temb, 'd2', ch, ch*2);
-      const d2 = conv3d(h2, 'down2.weight', 'down2.bias', 2, 1); // 2ch, /4
-      const h3 = resblock(d2, temb, 'd3', ch*2, ch*4);
-      let h = resblock(h3, temb, 'm1', ch*4, ch*4);
-      h = resblock(h, temb, 'm2', ch*4, ch*4);
-      const [B,D4,H4,W4] = [h.shape[0], h.shape[1], h.shape[2], h.shape[3]];
-      h = convT3d(h, 'up2.weight','up2.bias', [B, D4*2, H4*2, W4*2, ch*4]); // 4ch, /2
-      h = resblock(tf.concat([h, h2], 4), temb, 'u2', ch*4+ch*2, ch*2);
-      const [Bb,D2,H2,W2] = [h.shape[0], h.shape[1], h.shape[2], h.shape[3]];
-      h = convT3d(h, 'up1.weight','up1.bias', [Bb, D2*2, H2*2, W2*2, ch*2]); // 2ch, full
-      h = resblock(tf.concat([h, h1], 4), temb, 'head_u1', ch*2+ch, ch);
-      const out = conv3d(silu(groupNorm(h, 'head_norm.weight','head_norm.bias')),
-                         'head_conv.weight','head_conv.bias');
-      return out;                                                // [1,D,H,W,4]
-    });
-  }
-
-  // --- DDIM/ancestral sample (mirrors Diffusion.sample, eta=1, cfg=1) -------
-  async function sample(condNDHWC, themeIdx, attrArr, steps, seed = 1, onStep = null) {
-    const acp = manifest.schedule.acp;            // length T+1? -> T values
-    const T = manifest.schedule.T;
-    const [_, D, H, W, __] = condNDHWC.shape;
-    // seeded gaussian
-    let rngState = seed >>> 0;
-    const rand = () => { rngState = (rngState*1664525 + 1013904223) >>> 0; return rngState/4294967296; };
-    const randn = (n) => { const a=new Float32Array(n);
-      for(let i=0;i<n;i+=2){const u=Math.max(rand(),1e-9),v=rand();
-        const r=Math.sqrt(-2*Math.log(u)); a[i]=r*Math.cos(2*Math.PI*v);
-        if(i+1<n)a[i+1]=r*Math.sin(2*Math.PI*v);} return a; };
-    const N = D*H*W*4;
-    let x = tf.tensor(randn(N), [1,D,H,W,4]);
-    const seq = [];
-    for (let i=0;i<steps;i++) seq.push(Math.round((T-1) - (T-1)*i/(steps-1)));
-
-    for (let idx=0; idx<steps; idx++) {
-      await tf.nextFrame();             // yield to UI so the page stays responsive
-      if (onStep) onStep(idx, steps);
-      const t = seq[idx];
-      const a = Math.sqrt(acp[t]), b = Math.sqrt(1-acp[t]);
-      const v = forward(x, condNDHWC, t, themeIdx, attrArr, 1.0);
-      const x0 = tf.tidy(()=> tf.clipByValue(tf.sub(tf.mul(x,a), tf.mul(v,b)), -1, 1));
-      const eps = tf.tidy(()=> tf.add(tf.mul(x,b), tf.mul(v,a)));
-      v.dispose();
-      if (idx < steps-1) {
-        const tn = seq[idx+1];
-        const acpT = acp[t], acpN = acp[tn];
-        let sigma = 1.0 * Math.sqrt((1-acpN)/(1-acpT)) * Math.sqrt(1 - acpT/acpN);
-        if (!isFinite(sigma)) sigma = 0;
-        const c = Math.sqrt(Math.max(0, 1 - acpN - sigma*sigma));
-        const noise = tf.tensor(randn(N), [1,D,H,W,4]);
-        const xn = tf.tidy(()=> tf.add(tf.add(tf.mul(x0, Math.sqrt(acpN)), tf.mul(eps, c)),
-                                       tf.mul(noise, sigma)));
-        x.dispose(); x0.dispose(); eps.dispose(); noise.dispose();
-        x = xn;
-      } else {
-        x.dispose(); eps.dispose(); x = x0;
-      }
+    const half = dim / 2, arr = new Float32Array(dim);
+    for (let i = 0; i < half; i++) {
+      const fr = Math.exp(-Math.log(10000) * i / half);
+      arr[i] = Math.cos(tVal * fr);
+      arr[half + i] = Math.sin(tVal * fr);
     }
-    // apply footprint mask: outside cond -> -1
-    const out = tf.tidy(()=>{
-      const mask = tf.greater(condNDHWC, 0.5).toFloat();   // [1,D,H,W,1]
-      return tf.add(tf.mul(x, mask), tf.sub(mask, 1));
-    });
-    x.dispose();
-    return out;   // [1,D,H,W,4]
+    return tf.tensor(arr, [1, dim]);
   }
 
-  return { forward, sample, P };
+  function attention(x, i) {                   // x [1,L,DIM]
+    return tf.tidy(() => {
+      const qkv = linear(x, `blocks.${i}.qkv.weight`, `blocks.${i}.qkv.bias`); // [1,L,3·DIM]
+      const r = tf.transpose(tf.reshape(qkv, [L, 3, HEADS, HD]), [1, 2, 0, 3]); // [3,H,L,HD]
+      const q = tf.reshape(tf.slice(r, [0, 0, 0, 0], [1, HEADS, L, HD]), [HEADS, L, HD]);
+      const k = tf.reshape(tf.slice(r, [1, 0, 0, 0], [1, HEADS, L, HD]), [HEADS, L, HD]);
+      const v = tf.reshape(tf.slice(r, [2, 0, 0, 0], [1, HEADS, L, HD]), [HEADS, L, HD]);
+      const scores = tf.softmax(tf.mul(tf.matMul(q, k, false, true), 1 / Math.sqrt(HD)), -1);
+      const o = tf.reshape(tf.transpose(tf.matMul(scores, v), [1, 0, 2]), [1, L, DIM]);
+      return linear(o, `blocks.${i}.proj.weight`, `blocks.${i}.proj.bias`);
+    });
+  }
+
+  function block(x, c, i) {                    // x [1,L,DIM], c [1,DIM]
+    return tf.tidy(() => {
+      const ada = linear(silu(c), `blocks.${i}.ada.1.weight`, `blocks.${i}.ada.1.bias`); // [1,6·DIM]
+      const m = tf.reshape(ada, [1, 1, 6 * DIM]);
+      const [sh1, sc1, g1, sh2, sc2, g2] =
+        [0, 1, 2, 3, 4, 5].map(j => tf.slice(m, [0, 0, j * DIM], [1, 1, DIM]));
+      let h = tf.add(x, tf.mul(g1, attention(tf.add(tf.mul(layerNorm(x), tf.add(1, sc1)), sh1), i)));
+      const mlpIn = tf.add(tf.mul(layerNorm(h), tf.add(1, sc2)), sh2);
+      let f = gelu(linear(mlpIn, `blocks.${i}.mlp.0.weight`, `blocks.${i}.mlp.0.bias`));
+      f = linear(f, `blocks.${i}.mlp.2.weight`, `blocks.${i}.mlp.2.bias`);
+      return tf.add(h, tf.mul(g2, f));
+    });
+  }
+
+  // --- forward: NCHW Float32Arrays in and out ------------------------------
+  // x: (4, D, H, W) noised voxels; cond: (D, H, W) QR footprint;
+  // returns v prediction (4, D, H, W).
+  async function forward(xNCHW, condArr, tVal, themeIdx, attrArr, attrMask) {
+    const vox = GX * GX * GZ;
+    const xc = new Float32Array(CIN * vox);
+    xc.set(xNCHW, 0);
+    xc.set(condArr, 4 * vox);
+    const tokens = new Float32Array(L * PV);
+    for (let i = 0; i < tokens.length; i++) tokens[i] = xc[gatherIdx[i]];
+
+    const out = tf.tidy(() => {
+      // conditioning vector
+      let temb = linear(timestepEmbedding(tVal, 256), 'tmlp.0.weight', 'tmlp.0.bias');
+      temb = linear(silu(temb), 'tmlp.2.weight', 'tmlp.2.bias');
+      const themeRow = tf.reshape(tf.gather(P['theme_emb.weight'], [themeIdx]), [1, DIM]);
+      let attrEmb = linear(tf.tensor(attrArr, [1, 3]), 'attr_mlp.0.weight', 'attr_mlp.0.bias');
+      attrEmb = linear(silu(attrEmb), 'attr_mlp.2.weight', 'attr_mlp.2.bias');
+      const attrNull = tf.reshape(P['attr_null'], [1, DIM]);
+      attrEmb = tf.add(tf.mul(attrEmb, attrMask), tf.mul(attrNull, 1 - attrMask));
+      const c = tf.add(tf.add(temb, themeRow), attrEmb);
+
+      let h = linear(tf.tensor(tokens, [1, L, PV]), 'patch_embed.weight', 'patch_embed.bias');
+      h = tf.add(h, posT);
+      for (let i = 0; i < DEPTH; i++) h = block(h, c, i);
+
+      const adaF = tf.reshape(
+        linear(silu(c), 'ada_f.1.weight', 'ada_f.1.bias'), [1, 1, 2 * DIM]);
+      const sh = tf.slice(adaF, [0, 0, 0], [1, 1, DIM]);
+      const sc = tf.slice(adaF, [0, 0, DIM], [1, 1, DIM]);
+      const hf = tf.add(tf.mul(layerNorm(h), tf.add(1, sc)), sh);
+      return linear(hf, 'head.weight', 'head.bias');       // [1, L, p³·4]
+    });
+    const tok = await out.data();
+    out.dispose();
+
+    const v = new Float32Array(C_OUT * vox);
+    for (let i = 0; i < tok.length; i++) v[scatterIdx[i]] = tok[i];
+    return v;
+  }
+
+  return { forward, P };
 }

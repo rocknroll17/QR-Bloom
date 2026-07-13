@@ -11,17 +11,18 @@
 // and theme metadata. First page load kicks off background downloads of every
 // trained version; per-version inference waits only for the one it needs.
 //
-// ENGINE: tf.js on the WebGPU backend. (ORT's WebGPU EP supports 2-D conv
-// only — the UNet's 3-D ConvTranspose fails — and ORT-WASM is CPU-slow.) The
-// model (qrbloom-model.js) runs every 3-D conv as a stack of 2-D convs over
-// depth slices: numerically identical to the PyTorch model (max|diff| 3.8e-4)
-// but on tf.js's fast conv2d kernels (~8x faster than its conv3d). WebGPU
-// needs no COOP/COEP, so plain static hosting works.
+// ENGINE: tf.js on the WebGPU backend. The DiT backbone is matmul/attention
+// only (qrbloom-model.js) — no 3-D convs, so every GPU tensor stays rank ≤ 4
+// and runs on tf.js's fastest kernels. WebGPU needs no COOP/COEP, so plain
+// static hosting works.
 
 import qrcode from 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/+esm';
 import { makeQRBloom } from './qrbloom-model.js';
 
-const HF_BASE = 'https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/tfjs';
+// ?weights=<base> overrides the weight host — e.g. ?weights=./assets to test
+// a local export served next to the page, before it is uploaded to HF.
+const HF_BASE = new URLSearchParams(location.search).get('weights')
+  || 'https://huggingface.co/rocknroll17/QR-Bloom/resolve/main/tfjs';
 const MANIFEST_URL = `${HF_BASE}/manifest.json`;
 
 const T_TOTAL    = 500;        // Diffusion.T
@@ -219,8 +220,8 @@ async function buildVersionNet(version) {
       st.phase = 'creating-session';
       const net = makeQRBloom(tf, st.params, st.buf.buffer);
       const [gx, , gz] = st.params.grid;
-      const o = net.forward(tf.zeros([1,gx,gx,gz,4]), tf.zeros([1,gx,gx,gz,1]), 0, 0, [0.5,0.5,0.5], 1.0);
-      await o.data(); o.dispose();
+      await net.forward(new Float32Array(4 * gx * gx * gz),
+                        new Float32Array(gx * gx * gz), 0, 0, [0.5, 0.5, 0.5], 1.0);
       st.net = net; st.buf = null;   // free the raw bytes once on the GPU
       st.phase = 'ready';
       return net;
@@ -343,21 +344,6 @@ function fillNormal(arr) {
   }
 }
 
-// --- model forward: NCHW Float32Array -> v_pred NCHW Float32Array -----------
-// The diffusion loop below keeps the exact NCHW layout / math from the ONNX
-// path. The tf.js model is NDHWC, so transpose in and out around net.forward.
-
-async function forwardNCHW(net, xNCHW, D, H, W, t, condNDHWC, themeIdx) {
-  const vT = tf.tidy(() => {
-    const xND = tf.transpose(tf.tensor(xNCHW, [1, X0_CH, D, H, W]), [0, 2, 3, 4, 1]); // NDHWC
-    const v = net.forward(xND, condNDHWC, t, themeIdx, [0.5, 0.5, 0.5], 1.0);          // NDHWC
-    return tf.transpose(v, [0, 4, 1, 2, 3]);                                           // NCHW
-  });
-  const data = await vT.data();
-  vT.dispose();
-  return data;
-}
-
 // --- model_generate-equivalent sampling loop -------------------------------
 
 async function sampleVoxels(net, version, themeIdx, qr, onPhase) {
@@ -380,8 +366,6 @@ async function sampleVoxels(net, version, themeIdx, qr, onPhase) {
       }
     }
   }
-  const condNDHWC = tf.tensor(condArr, [1, D, H, W, 1]);   // built once, reused every step
-
   let x = new Float32Array(voxN);
   fillNormal(x);
 
@@ -391,7 +375,7 @@ async function sampleVoxels(net, version, themeIdx, qr, onPhase) {
 
   for (let idx = 0; idx < steps; idx++) {
     const t = seq[idx];
-    const vPred = await forwardNCHW(net, x, D, H, W, t, condNDHWC, themeIdx);  // Float32Array NCHW
+    const vPred = await net.forward(x, condArr, t, themeIdx, [0.5, 0.5, 0.5], 1.0);  // Float32Array NCHW
     const a = SCHED.sqrt_acp[t];
     const b = SCHED.sqrt_one_minus_acp[t];
     // x0_pred = a*x - b*v, clamp(-1,1); eps_pred = b*x + a*v
@@ -422,7 +406,6 @@ async function sampleVoxels(net, version, themeIdx, qr, onPhase) {
       onPhase('sampling', { version, step: idx + 1, total: steps });
     }
   }
-  condNDHWC.dispose();
 
   // Enforce footprint: outside QR mask, set to -1 (will be rejected by occ > 0).
   for (let i = 0; i < D; i++) {
