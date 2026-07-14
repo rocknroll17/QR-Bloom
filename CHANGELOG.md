@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.4.0](https://github.com/rocknroll17/QR-Bloom/compare/v1.3.1...v1.4.0) (2026-07-14)
+
+
+### Features
+
+* **pages:** grow-in animation — voxels rise from the trunk (BFS) on generate ([#68](https://github.com/rocknroll17/QR-Bloom/issues/68)) ([0d09643](https://github.com/rocknroll17/QR-Bloom/commit/0d09643d375337432f9a96780bafbf4d2fe66645))
+
+
+### Bug Fixes
+
+* **diffusion:** make occupancy pos_weight a per-voxel map instead of per-sample scalar ([#70](https://github.com/rocknroll17/QR-Bloom/issues/70)) ([1b7d567](https://github.com/rocknroll17/QR-Bloom/commit/1b7d567b3701fb283a5d92e7cc90a052ccffb1ad))
+
 ## [1.3.1](https://github.com/rocknroll17/QR-Bloom/compare/v1.3.0...v1.3.1) (2026-06-09)
 
 
