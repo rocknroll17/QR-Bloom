@@ -1,17 +1,16 @@
 # SPDX-FileCopyrightText: 2026 rocknroll17
 # SPDX-License-Identifier: MIT
 
-"""QR-Bloom training script.
+"""QR-Bloom training entry point.
 
 Trains the QR-conditioned voxel tree diffusion model (one DiT3D across all
-QR versions) using v-prediction. Training data is generated on-the-fly:
-each sample is a procedurally grown voxel tree placed inside a QR
-footprint. The voxel grid size depends on the QR version (see
-qrbloom.qr.grid_shape_for_version); batches are bucketed so each batch
-holds a single version. The model learns to denoise a 4-channel
-(RGB + occupancy) voxel grid conditioned on the QR footprint, a
-tree-species theme index, three shape attributes, and the QR version.
+QR versions) using v-prediction. Training data is generated on-the-fly
+(qrbloom.data); batches are bucketed so each batch holds a single QR
+version. The model learns to denoise a 4-channel (RGB + occupancy) voxel
+grid conditioned on the QR footprint, a tree-species theme index, three
+shape attributes, and the QR version.
 
+Configuration comes from environment variables (see TrainConfig.from_env).
 Losses (see qrbloom/model.py p_losses):
   v_mse : v-prediction MSE over all 4 channels
   v_rgb : v-prediction MSE restricted to the RGB channels
@@ -26,92 +25,33 @@ Outputs (with `VARIANT` env var suffix, e.g. VARIANT=_all):
 """
 from __future__ import annotations
 
+import json
+import math
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from qrbloom.model import DiT3D, Diffusion, EMA, DOWNSCALE
-from qrbloom.qr import (THEME_NAMES as DS_THEMES, random_qr_core,
-                        qr_modules, grid_xy_for_version,
-                        grid_z_for_version, pad_to_grid)
-from qrbloom.treegen import SPECIES
-from qrbloom.treegen import generate_voxels_aug as generate_voxels, tree_attributes
-import json as _json
-import random as _random
+from qrbloom.data import BlockBatchSampler, LiveTreeDataset, pad_collate
+from qrbloom.model import DiT3D, Diffusion, EMA
+from qrbloom.qr import grid_xy_for_version, grid_z_for_version, qr_modules
+from qrbloom.treegen import THEME_NAMES, attr_means
+from qrbloom.viz import render_montage, save_epoch_json, save_loss_curve
 
-# ─── Distributed environment ──────────────────────────────────────────────────
-LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
-WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
-RANK = int(os.environ.get("RANK", "0"))
-IS_DIST = WORLD_SIZE > 1
-IS_MAIN = RANK == 0
+LOSS_KEYS = ("v_mse", "v_rgb", "v_occ")
 
-if IS_DIST:
-    dist.init_process_group(backend="nccl")
-    torch.cuda.set_device(LOCAL_RANK)
-    DEVICE = f"cuda:{LOCAL_RANK}"
-else:
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ─── Hyperparameters ──────────────────────────────────────────────────────────
-EPOCHS = int(os.environ.get("EPOCHS", "80"))
-BATCH = int(os.environ.get("BATCH", "42"))
-BASE_LR = float(os.environ.get("LR", "2e-4"))
-T = int(os.environ.get("T", "500"))
-SUBSET_FRAC = float(os.environ.get("SUBSET_FRAC", "1.0"))
-VAL_FRAC = float(os.environ.get("VAL_FRAC", "0.10"))
-SEED = int(os.environ.get("SEED", "42"))
-WORKERS = int(os.environ.get("WORKERS", "2"))
-AMP_DTYPE = os.environ.get("AMP_DTYPE", "fp16").lower()
-COMPILE = bool(int(os.environ.get("COMPILE", "0")))
-VAL_EVERY = int(os.environ.get("VAL_EVERY", "1"))
-SAMPLE_STEPS = int(os.environ.get("SAMPLE_STEPS", "100"))  # stochastic sampling steps
-EPOCH_SIZE = int(os.environ.get("EPOCH_SIZE", "100000"))   # live-generated samples per epoch
-VAL_SIZE = int(os.environ.get("VAL_SIZE", "2400"))         # fixed validation set size
-VARIANT = os.environ.get("VARIANT", "")
-SUFFIX = VARIANT
-# Warm-start checkpoint: weights are loaded non-strict into the fresh model
-# (e.g. seed a multi-version run from a single-version specialist). Ignored
-# when a resume checkpoint for this VARIANT already exists.
-INIT_FROM = os.environ.get("INIT_FROM", "")
-# RESET_BEST=1 discards the historical best on resume. Required when the
-# loss definition changes mid-run: the stale best (old loss scale) could
-# otherwise never be beaten and best-checkpoint saving would stall.
-RESET_BEST = bool(int(os.environ.get("RESET_BEST", "0")))
-
-# ── DiT backbone hyperparameters ──────────────────────────────────────────────
-DIT_DIM = int(os.environ.get("DIT_DIM", "384"))
-DIT_DEPTH = int(os.environ.get("DIT_DEPTH", "12"))
-DIT_HEADS = int(os.environ.get("DIT_HEADS", "6"))
-DIT_PATCH = int(os.environ.get("DIT_PATCH", "4"))
-DIT_CKPT = bool(int(os.environ.get("DIT_CKPT", "0")))  # gradient checkpointing
-
-# Multi-version training: pick a QR version per sample from this set. The
-# DiT backbone builds its positional embeddings from the input size, so a
-# single set of weights handles any grid whose dims are multiples of the
-# patch size. To bound memory, training defaults to v1..v5 (XY up to 40).
-# Set QR_VERSIONS="1,2,3,5,10" to widen the range.
 def _parse_versions(s: str) -> list[int]:
-    out = []
-    for tok in s.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        out.append(int(tok))
+    out = [int(tok) for tok in s.split(",") if tok.strip()]
     if not out:
         raise ValueError("QR_VERSIONS must contain at least one version")
     return out
-
-QR_VERSIONS = _parse_versions(os.environ.get("QR_VERSIONS", "2,3,4,5"))
-QR_VERSIONS_VAL = _parse_versions(os.environ.get("QR_VERSIONS_VAL",
-                                                  os.environ.get("QR_VERSIONS", "2,3,4,5")))
 
 
 def _parse_weights(s: str, versions: list[int]) -> list[float]:
@@ -121,8 +61,6 @@ def _parse_weights(s: str, versions: list[int]) -> list[float]:
     fewer dark modules), so when training on a mix of versions the default
     tilts sampling toward them: weight = (max_v - v + 1). For versions
     [2,3,4,5] that gives [4,3,2,1] → roughly 40/30/20/10% of the batch.
-    Override with QR_VERSION_WEIGHTS="w_v2,w_v3,..." in the env.
-    Single-version training simply sets weights=[1.0].
     """
     if not s:
         max_v = max(versions)
@@ -138,262 +76,98 @@ def _parse_weights(s: str, versions: list[int]) -> list[float]:
     return ws
 
 
-QR_VERSION_WEIGHTS = _parse_weights(os.environ.get("QR_VERSION_WEIGHTS", ""),
-                                     QR_VERSIONS)
-# Largest XY/Z the trainer may see — informational, used in startup log only.
-MAX_XY = max(grid_xy_for_version(v) for v in (QR_VERSIONS + QR_VERSIONS_VAL))
-MAX_Z  = max(grid_z_for_version(v)  for v in (QR_VERSIONS + QR_VERSIONS_VAL))
+@dataclass
+class TrainConfig:
+    """Everything a training run needs, resolved once up front."""
+    epochs: int = 80
+    batch: int = 42
+    lr: float = 2e-4
+    timesteps: int = 500
+    seed: int = 42
+    workers: int = 2
+    amp_dtype: str = "fp16"
+    compile: bool = False
+    val_every: int = 1
+    sample_steps: int = 100      # stochastic sampling steps for epoch previews
+    epoch_size: int = 100000     # live-generated samples per epoch
+    val_size: int = 2400         # fixed validation set size
+    variant: str = ""
+    # Warm-start checkpoint: weights are loaded non-strict into the fresh
+    # model (e.g. seed a multi-version run from a single-version specialist).
+    # Ignored when a resume checkpoint for this variant already exists.
+    init_from: str = ""
+    # reset_best discards the historical best on resume. Required when the
+    # loss definition changes mid-run: the stale best (old loss scale) could
+    # otherwise never be beaten and best-checkpoint saving would stall.
+    reset_best: bool = False
+    # DiT backbone hyperparameters.
+    dit_dim: int = 384
+    dit_depth: int = 12
+    dit_heads: int = 6
+    dit_patch: int = 4
+    dit_grad_checkpoint: bool = False
+    # Multi-version training: which QR versions to sample, with what weights.
+    versions: list[int] = field(default_factory=lambda: [2, 3, 4, 5])
+    versions_val: list[int] = field(default_factory=lambda: [2, 3, 4, 5])
+    version_weights: list[float] = field(default_factory=lambda: [4.0, 3.0, 2.0, 1.0])
+    # Montage: pin the preview QR version (None → seeded pick from versions_val).
+    mont_version: int | None = None
+    demo_url: str = "https://example.com"
 
-_AMP_TH = torch.bfloat16 if AMP_DTYPE == "bf16" else torch.float16
+    @classmethod
+    def from_env(cls) -> "TrainConfig":
+        env = os.environ.get
+        versions = _parse_versions(env("QR_VERSIONS", "2,3,4,5"))
+        versions_val = _parse_versions(env("QR_VERSIONS_VAL",
+                                           env("QR_VERSIONS", "2,3,4,5")))
+        mv = env("MONT_VERSION", "").strip()
+        return cls(
+            epochs=int(env("EPOCHS", "80")),
+            batch=int(env("BATCH", "42")),
+            lr=float(env("LR", "2e-4")),
+            timesteps=int(env("T", "500")),
+            seed=int(env("SEED", "42")),
+            workers=int(env("WORKERS", "2")),
+            amp_dtype=env("AMP_DTYPE", "fp16").lower(),
+            compile=bool(int(env("COMPILE", "0"))),
+            val_every=int(env("VAL_EVERY", "1")),
+            sample_steps=int(env("SAMPLE_STEPS", "100")),
+            epoch_size=int(env("EPOCH_SIZE", "100000")),
+            val_size=int(env("VAL_SIZE", "2400")),
+            variant=env("VARIANT", ""),
+            init_from=env("INIT_FROM", ""),
+            reset_best=bool(int(env("RESET_BEST", "0"))),
+            dit_dim=int(env("DIT_DIM", "384")),
+            dit_depth=int(env("DIT_DEPTH", "12")),
+            dit_heads=int(env("DIT_HEADS", "6")),
+            dit_patch=int(env("DIT_PATCH", "4")),
+            dit_grad_checkpoint=bool(int(env("DIT_CKPT", "0"))),
+            versions=versions,
+            versions_val=versions_val,
+            version_weights=_parse_weights(env("QR_VERSION_WEIGHTS", ""), versions),
+            mont_version=int(mv) if mv else None,
+            demo_url=env("DEMO_URL", "https://example.com"),
+        )
 
-if torch.cuda.is_available():
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    @property
+    def amp_th(self) -> torch.dtype:
+        return torch.bfloat16 if self.amp_dtype == "bf16" else torch.float16
 
-# Loss keys used for logging and aggregation.
-LOSS_KEYS = ("v_mse", "v_rgb", "v_occ")
+    @property
+    def ckpt(self) -> Path:
+        return Path("checkpoints") / f"qrbloom{self.variant}.pt"
 
+    @property
+    def ckpt_best(self) -> Path:
+        return Path("checkpoints") / f"qrbloom{self.variant}_best.pt"
 
-def _version_for_index(idx: int, versions, weights, batch: int, seed: int) -> int:
-    """QR version for sample `idx`, constant within each batch-sized block.
+    @property
+    def out_dir(self) -> Path:
+        return Path(f"runs{self.variant}")
 
-    Bucketed batching (NovelAI-style aspect-ratio bucketing, adapted to QR
-    versions): BlockBatchSampler emits contiguous index blocks and this pure
-    function assigns each block a single version, so every batch is uniform
-    in grid size — no padding voxels, no attention over padding tokens.
-    Being a pure function of (idx, seed), the sampler and every DataLoader
-    worker agree on the schedule without shared state.
-    """
-    if len(versions) == 1:
-        return versions[0]
-    ws = weights if weights is not None else [1.0] * len(versions)
-    r = _random.Random(seed * 1000003 + idx // batch).random() * sum(ws)
-    acc = 0.0
-    for v, w in zip(versions, ws):
-        acc += w
-        if r < acc:
-            return v
-    return versions[-1]
-
-
-class BlockBatchSampler(torch.utils.data.Sampler):
-    """Yields contiguous index blocks of size `batch` (one QR version each).
-
-    Blocks are interleaved across DDP ranks and their order is shuffled per
-    epoch; indices inside a block stay contiguous so `_version_for_index`
-    holds one version for the whole batch.
-    """
-
-    def __init__(self, n: int, batch: int, world: int = 1, rank: int = 0,
-                 shuffle: bool = True, seed: int = 0):
-        self.batch = batch
-        self.shuffle = shuffle
-        self.seed = seed
-        self.epoch = 0
-        self.blocks = [b for b in range(n // batch) if b % world == rank]
-
-    def set_epoch(self, epoch: int):
-        self.epoch = epoch
-
-    def __len__(self):
-        return len(self.blocks)
-
-    def __iter__(self):
-        order = list(self.blocks)
-        if self.shuffle:
-            _random.Random(self.seed + self.epoch).shuffle(order)
-        for b in order:
-            yield list(range(b * self.batch, (b + 1) * self.batch))
-
-
-class LiveTreeDataset(torch.utils.data.Dataset):
-    """Dataset that generates a fresh (QR, theme, augmentation) sample on every access.
-
-    Each sample is built for the QR version that `_version_for_index`
-    assigns to its batch block, so grids inside one batch always match.
-    The voxel grid's XY *and Z* size both depend on the version (isotropic
-    scaling — see qrbloom.qr.grid_z_for_version).
-
-    deterministic=False (train): each sample uses system entropy — no repeats.
-    deterministic=True  (val):   each index maps to a fixed seed — reproducible.
-
-    Returns: (occ_u8, rgb_u8, qr_u8, theme_idx, attr, version)
-    """
-
-    def __init__(self, virtual_len, versions, deterministic, seed=0, weights=None,
-                 batch=1):
-        self.virtual_len = int(virtual_len)
-        self.versions = list(versions)
-        # weights=None → uniform sampling (used for val so the metric is
-        # version-balanced). Train passes per-version weights to oversample
-        # the harder lower QR versions.
-        self.weights = list(weights) if weights is not None else None
-        self.deterministic = deterministic
-        self.seed = seed
-        self.batch = int(batch)
-
-    def __len__(self):
-        return self.virtual_len
-
-    def _rng(self, idx):
-        if self.deterministic:
-            s = (self.seed * 1000003 + idx) & 0x7FFFFFFF
-            return _random.Random(s), np.random.default_rng(s)
-        return _random.Random(), np.random.default_rng()
-
-    def __getitem__(self, idx):
-        rng, nprng = self._rng(idx)
-        version = _version_for_index(idx, self.versions, self.weights,
-                                     self.batch, self.seed)
-        qe = qr_modules(version)
-        gxy = grid_xy_for_version(version)
-        gz  = grid_z_for_version(version)
-        off = (gxy - qe) // 2
-        ctr = qe // 2
-
-        core = random_qr_core(nprng, version=version)         # (qe, qe) uint8
-        ti = rng.randint(0, len(DS_THEMES) - 1)
-        voxels = generate_voxels(core.tolist(), theme=DS_THEMES[ti], rng=rng)
-
-        occ = np.zeros((gxy, gxy, gz), dtype=np.uint8)
-        rgb = np.zeros((3, gxy, gxy, gz), dtype=np.uint8)
-        for v in voxels:
-            if v["is_base"]:
-                continue
-            x, y, z = v["pos"]
-            i = off + int(round(z)) + ctr
-            j = off + int(round(x)) + ctr
-            k = int(round(y))
-            if 0 <= i < gxy and 0 <= j < gxy and 0 <= k < gz:
-                occ[i, j, k] = 1
-                h = v["color"].lstrip("#")
-                rgb[0, i, j, k] = int(h[0:2], 16)
-                rgb[1, i, j, k] = int(h[2:4], 16)
-                rgb[2, i, j, k] = int(h[4:6], 16)
-        qr, _ = pad_to_grid(core, grid_xy=gxy)
-        attr = np.array(tree_attributes(voxels, qr_side=qe), dtype=np.float32)
-        return (torch.from_numpy(occ), torch.from_numpy(rgb),
-                torch.from_numpy(qr), ti, torch.from_numpy(attr),
-                int(version))
-
-
-def pad_collate(batch):
-    """Collate items of varying XY/Z by zero-padding to the largest in the batch.
-
-    With bucketed batching every batch is a single version, so this is a
-    plain stack; the padding path remains as a safety net for callers that
-    mix versions. XY padding is symmetric around the QR center; Z padding
-    is one-sided (extend upward) so the QR base plane stays at z=0. Both
-    are rounded up to multiples of DOWNSCALE.
-
-    Input shapes per sample:
-      occ : (gxy, gxy, gz)
-      rgb : (3, gxy, gxy, gz)
-      qr  : (gxy, gxy)              — 2D footprint, no Z
-    """
-    occs, rgbs, qrs, ths, attrs, vers = zip(*batch)
-    max_xy = max(o.shape[0] for o in occs)
-    max_z  = max(o.shape[2] for o in occs)
-    max_xy = ((max_xy + DOWNSCALE - 1) // DOWNSCALE) * DOWNSCALE
-    max_z  = ((max_z  + DOWNSCALE - 1) // DOWNSCALE) * DOWNSCALE
-
-    def _pad_occ(t: torch.Tensor) -> torch.Tensor:
-        # (D, H, W) — pad W (Z) one-sided, D/H symmetric.
-        D, H, W = t.shape
-        pz = max_z - W
-        pad_d_l = (max_xy - D) // 2
-        pad_d_r = (max_xy - D) - pad_d_l
-        pad_h_l = (max_xy - H) // 2
-        pad_h_r = (max_xy - H) - pad_h_l
-        # F.pad order for 3D tensor: (W_l, W_r, H_l, H_r, D_l, D_r)
-        return F.pad(t, (0, pz, pad_h_l, pad_h_r, pad_d_l, pad_d_r))
-
-    def _pad_rgb(t: torch.Tensor) -> torch.Tensor:
-        # (C, D, H, W)
-        _, D, H, W = t.shape
-        pz = max_z - W
-        pad_d_l = (max_xy - D) // 2
-        pad_d_r = (max_xy - D) - pad_d_l
-        pad_h_l = (max_xy - H) // 2
-        pad_h_r = (max_xy - H) - pad_h_l
-        return F.pad(t, (0, pz, pad_h_l, pad_h_r, pad_d_l, pad_d_r))
-
-    def _pad_qr(t: torch.Tensor) -> torch.Tensor:
-        # (D, H)
-        D, H = t.shape
-        pad_d_l = (max_xy - D) // 2
-        pad_d_r = (max_xy - D) - pad_d_l
-        pad_h_l = (max_xy - H) // 2
-        pad_h_r = (max_xy - H) - pad_h_l
-        return F.pad(t, (pad_h_l, pad_h_r, pad_d_l, pad_d_r))
-
-    occ_b = torch.stack([_pad_occ(o) for o in occs], 0)
-    rgb_b = torch.stack([_pad_rgb(r) for r in rgbs], 0)
-    qr_b = torch.stack([_pad_qr(q) for q in qrs], 0)
-    th_b = torch.tensor(list(ths), dtype=torch.long)
-    attr_b = torch.stack(list(attrs), 0)
-    ver_b = torch.tensor(list(vers), dtype=torch.long)
-    return occ_b, rgb_b, qr_b, th_b, attr_b, ver_b
-
-
-def log(*args, **kwargs):
-    if IS_MAIN:
-        print(*args, **kwargs, flush=True)
-
-
-CKPT_DIR = Path("checkpoints")
-CKPT = CKPT_DIR / f"qrbloom{SUFFIX}.pt"
-CKPT_BEST = CKPT_DIR / f"qrbloom{SUFFIX}_best.pt"
-OUT_DIR = Path(f"runs{SUFFIX}")
-DONE = Path(f"checkpoints/DONE{SUFFIX}")
-
-THEMES = list(DS_THEMES)   # montage labels — kept in sync with the generator
-
-
-# ─── Visualization ────────────────────────────────────────────────────────────
-def render_montage(occ_bin: np.ndarray, rgb: np.ndarray, qrs: np.ndarray,
-                   themes: np.ndarray, path: str) -> None:
-    """Render a 3D scatter + top-down overlay for each sample in the batch."""
-    import matplotlib.pyplot as plt
-    B = min(occ_bin.shape[0], 9)
-    D, H, W = occ_bin.shape[1], occ_bin.shape[2], occ_bin.shape[3]
-    fig = plt.figure(figsize=(B * 2.0, 5.0))
-    for i in range(B):
-        ax = fig.add_subplot(2, B, i + 1, projection="3d")
-        rs, cs, hs = np.where(occ_bin[i])
-        if rs.size:
-            cols_rgb = (np.transpose(rgb[i], (1, 2, 3, 0))[rs, cs, hs] * 0.5 + 0.5).clip(0, 1)
-            ax.scatter(cs, rs, hs, c=cols_rgb, s=8, marker="s", depthshade=False)
-        ax.set_xlim(0, D)
-        ax.set_ylim(0, H)
-        ax.set_zlim(0, W)
-        ax.set_box_aspect((1, 1, 1))
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_zticks([])
-        ax.set_title(f"{THEMES[themes[i]]}\nn={occ_bin[i].sum()}", fontsize=7)
-        ax2 = fig.add_subplot(2, B, B + i + 1)
-        top = occ_bin[i].max(axis=2)
-        ax2.imshow(np.stack([qrs[i], top, np.zeros_like(top)], axis=-1) * 0.7 + 0.1)
-        ax2.set_xticks([])
-        ax2.set_yticks([])
-        ax2.set_title("R=QR  G=pred top", fontsize=7)
-    plt.tight_layout()
-    plt.savefig(path, dpi=110)
-    plt.close(fig)
-
-
-# ─── Training / evaluation ────────────────────────────────────────────────────
-def make_split(n_total: int, val_frac: float, subset_frac: float, seed: int):
-    g = np.random.default_rng(seed)
-    perm = g.permutation(n_total)
-    n_val = max(1, int(n_total * val_frac))
-    val_idx = perm[:n_val]
-    train_pool = perm[n_val:]
-    n_train = max(1, int(len(train_pool) * subset_frac))
-    train_idx = train_pool[:n_train]
-    return train_idx.tolist(), val_idx.tolist()
+    @property
+    def done_marker(self) -> Path:
+        return Path("checkpoints") / f"DONE{self.variant}"
 
 
 def _safe_save(state: dict, path: Path) -> None:
@@ -422,234 +196,113 @@ def _unwrap(m):
     return m.module if isinstance(m, DDP) else m
 
 
-def evaluate(model, diff, loader, device) -> dict:
-    """Compute mean losses and occupancy IoU on the validation set.
+class Trainer:
+    """Owns a full training run: distributed setup, data, model/EMA/optimizer,
+    the epoch loop, validation, montage rendering, and checkpointing."""
 
-    IoU is estimated by injecting low-level noise (t = T/10) and measuring
-    denoising accuracy at that timestep. Per-version mean losses are
-    reported as "v{N}" keys — in multi-version training a single version
-    can collapse while the aggregate mean still looks healthy, so each
-    version is watched separately.
-    """
-    model.eval()
-    parts_sum = {k: 0.0 for k in LOSS_KEYS}
-    parts_sum["total"] = 0.0
-    iou_num = iou_den = 0.0
-    n_batches = 0
-    ver_list = sorted(set(QR_VERSIONS_VAL))
-    ver_loss = {v: 0.0 for v in ver_list}
-    ver_n = {v: 0 for v in ver_list}
-    t_probe = max(1, T // 10)
-    with torch.no_grad():
-        for occ_u8, rgb_u8, qr_u8, th, attr, ver in loader:
-            x0, cond = _normalize_batch(occ_u8, rgb_u8, qr_u8, device)
-            theme = th.to(device, non_blocking=True)
-            attr = attr.to(device, non_blocking=True)
-            ver = ver.to(device, non_blocking=True)
-            with torch.amp.autocast("cuda", dtype=_AMP_TH):
-                loss, info = diff.p_losses(model, x0, cond, theme, attr, version=ver)
-            for k, v in info.items():
-                parts_sum[k] += v.item()
-            parts_sum["total"] += loss.item()
-            v0 = int(ver[0].item())          # bucketed batch: one version
-            if v0 in ver_loss:
-                ver_loss[v0] += loss.item()
-                ver_n[v0] += 1
-            # Inject fixed small-t noise, recover x0, threshold occupancy for IoU.
-            tb = torch.full((x0.size(0),), t_probe, dtype=torch.long, device=device)
-            noise = torch.randn_like(x0)
-            xt = diff.q_sample(x0, tb, noise)
-            am = torch.ones(x0.size(0), device=device)
-            with torch.amp.autocast("cuda", dtype=_AMP_TH):
-                v_pred = _unwrap(model)(xt, tb, cond, theme, attr, am, ver)
-            x0_pred = diff.x0_from_v(xt, tb, v_pred.float())
-            occ_pred = (x0_pred[:, 3] > 0).float()
-            occ_gt = (x0[:, 3] > 0).float()
-            iou_num += (occ_pred * occ_gt).sum().item()
-            iou_den += (occ_pred + occ_gt - occ_pred * occ_gt).sum().item()
-            n_batches += 1
+    def __init__(self, cfg: TrainConfig):
+        self.cfg = cfg
+        self._setup_distributed()
+        self._setup_backends()
+        if self.is_main:
+            self.cfg.ckpt.parent.mkdir(parents=True, exist_ok=True)
+            self.cfg.out_dir.mkdir(parents=True, exist_ok=True)
+        if self.is_dist:
+            dist.barrier()
+        self._setup_data()
+        self._setup_montage()
+        self._setup_model()
+        self._resume()
 
-    if IS_DIST:
-        buf = torch.tensor(
-            [parts_sum[k] for k in LOSS_KEYS] + [parts_sum["total"],
-             iou_num, iou_den, float(n_batches)]
-            + [ver_loss[v] for v in ver_list] + [float(ver_n[v]) for v in ver_list],
-            device=device, dtype=torch.float64,
-        )
-        dist.all_reduce(buf, op=dist.ReduceOp.SUM)
-        vals = buf.tolist()
-        for i, k in enumerate(LOSS_KEYS):
-            parts_sum[k] = vals[i]
-        parts_sum["total"] = vals[len(LOSS_KEYS)]
-        iou_num, iou_den = vals[len(LOSS_KEYS) + 1], vals[len(LOSS_KEYS) + 2]
-        n_batches = max(int(vals[len(LOSS_KEYS) + 3]), 1)
-        off = len(LOSS_KEYS) + 4
-        for i, v in enumerate(ver_list):
-            ver_loss[v] = vals[off + i]
-            ver_n[v] = int(vals[off + len(ver_list) + i])
+    # ── logging ──────────────────────────────────────────────────────────
+    def log(self, *args, **kwargs):
+        if self.is_main:
+            print(*args, **kwargs, flush=True)
 
-    for k in parts_sum:
-        parts_sum[k] /= max(n_batches, 1)
-    parts_sum["iou"] = iou_num / max(iou_den, 1e-6)
-    for v in ver_list:
-        parts_sum[f"v{v}"] = ver_loss[v] / max(ver_n[v], 1)
-    model.train()
-    return parts_sum
+    # ── setup ────────────────────────────────────────────────────────────
+    def _setup_distributed(self):
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self.world = int(os.environ.get("WORLD_SIZE", "1"))
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.is_dist = self.world > 1
+        self.is_main = self.rank == 0
+        if self.is_dist:
+            dist.init_process_group(backend="nccl")
+            torch.cuda.set_device(self.local_rank)
+            self.device = f"cuda:{self.local_rank}"
+        else:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    def _setup_backends(self):
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
-def save_epoch_json(ep, occ, rgb_pred, qrs_np, theme_np, path, version):
-    """Write a gallery-compatible JSON file for the given epoch's samples."""
-    qe = qr_modules(version)
-    gxy = qrs_np.shape[1]                # padded XY grid edge
-    off = (gxy - qe) // 2
-    ctr = qe // 2
-    samples = []
-    for idx in range(len(occ)):
-        theme = DS_THEMES[int(theme_np[idx])]
-        sp = SPECIES[theme]
-        cells = []
-        core = qrs_np[idx][off:off + qe, off:off + qe]
-        for i in range(qe):
-            for j in range(qe):
-                col_hex = sp.qr_dark if core[i, j] else sp.qr_light
-                cells.append([int(j - ctr), 0, int(i - ctr), 1.0, col_hex])
-        rs, cs, hs = np.where(occ[idx])
-        for r, c, k in zip(rs, cs, hs):
-            if k < 1:
-                continue
-            rr = int(np.clip((rgb_pred[idx, 0, r, c, k] + 1) * 127.5, 0, 255))
-            gg = int(np.clip((rgb_pred[idx, 1, r, c, k] + 1) * 127.5, 0, 255))
-            bb = int(np.clip((rgb_pred[idx, 2, r, c, k] + 1) * 127.5, 0, 255))
-            color = f"#{rr:02x}{gg:02x}{bb:02x}"
-            x = int(c - (off + ctr))
-            z = int(r - (off + ctr))
-            cells.append([x, int(k), z, 1.0, color])
-        samples.append({"theme": theme, "cells": cells, "count": len(cells)})
-    with open(path, "w") as f:
-        _json.dump({"ep": ep, "version": version, "samples": samples}, f)
+    def _setup_data(self):
+        cfg = self.cfg
+        # Training samples are generated live; validation uses fixed seeds.
+        train_ds = LiveTreeDataset(cfg.epoch_size, versions=cfg.versions,
+                                   deterministic=False,
+                                   weights=cfg.version_weights, batch=cfg.batch)
+        val_ds = LiveTreeDataset(cfg.val_size, versions=cfg.versions_val,
+                                 deterministic=True, seed=999, batch=cfg.batch)
+        w_sum = sum(cfg.version_weights) or 1.0
+        w_pct = [f"v{v}:{100 * w / w_sum:.0f}%"
+                 for v, w in zip(cfg.versions, cfg.version_weights)]
+        max_xy = max(grid_xy_for_version(v) for v in cfg.versions + cfg.versions_val)
+        max_z = max(grid_z_for_version(v) for v in cfg.versions + cfg.versions_val)
+        self.log(f"[data] live generation — epoch_size={cfg.epoch_size} val={cfg.val_size}  "
+                 f"train_versions={cfg.versions}  val_versions={cfg.versions_val}  "
+                 f"max_xy={max_xy}  max_z={max_z}")
+        self.log(f"[data] train weights — {' '.join(w_pct)}  (raw={cfg.version_weights})")
 
+        # Bucketed batching: block samplers keep every batch single-version.
+        self.train_sampler = BlockBatchSampler(len(train_ds), cfg.batch,
+                                               world=self.world, rank=self.rank,
+                                               shuffle=True, seed=cfg.seed)
+        val_sampler = BlockBatchSampler(len(val_ds), cfg.batch,
+                                        world=self.world, rank=self.rank,
+                                        shuffle=False)
+        dl_kw = dict(num_workers=cfg.workers, pin_memory=True, collate_fn=pad_collate)
+        if cfg.workers > 0:
+            dl_kw.update(persistent_workers=True, prefetch_factor=4)
+        self.train_dl = DataLoader(train_ds, batch_sampler=self.train_sampler, **dl_kw)
+        self.val_dl = DataLoader(val_ds, batch_sampler=val_sampler, **dl_kw)
+        self.log(f"[loader] steps/epoch(per-rank)={len(self.train_dl)}  "
+                 f"val batches(per-rank)={len(self.val_dl)}  "
+                 f"workers={cfg.workers}  amp={cfg.amp_dtype}  world={self.world}  "
+                 f"batch/gpu={cfg.batch}  global_batch={cfg.batch * self.world}")
 
-def save_loss_curve(hist, path):
-    import matplotlib.pyplot as plt
-    if not hist:
-        return
-    epochs = [h["epoch"] for h in hist]
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(epochs, [h["train"]["total"] for h in hist], label="train_total", lw=1.5)
-    ax.plot(epochs, [h["val_total"] for h in hist], label="val_total", lw=1.2)
-    ax.plot(epochs, [h["train"]["v_rgb"] for h in hist], label="v_rgb", alpha=0.6)
-    ax.plot(epochs, [h["train"]["v_occ"] for h in hist], label="v_occ", alpha=0.6)
-    ax.set_xlabel("epoch")
-    ax.set_ylabel("loss")
-    ax.grid(alpha=0.3)
-    ax.legend(loc="upper right")
-    fig.tight_layout()
-    fig.savefig(path, dpi=100)
-    plt.close(fig)
+    def _setup_montage(self):
+        """Build 9 unseen QR codes (one per theme) for the per-epoch montage.
 
-
-def sample_montage(diff, ema, mont_batch, mont_version, ep, png_path, device,
-                   json_path=None):
-    """Sample the EMA model stochastically for each theme and write PNG + JSON."""
-    m_eval = DiT3D(dim=DIT_DIM, depth=DIT_DEPTH, heads=DIT_HEADS,
-                   patch=DIT_PATCH, n_themes=len(DS_THEMES)).to(device)
-    ema.copy_to(m_eval)
-    m_eval.eval()
-    occ_u8, rgb_u8, qr_u8, th = mont_batch
-    qr = qr_u8.float().to(device)
-    # Montage uses the mont_version-specific Z extent so the sampled grid
-    # matches the data distribution at that version.
-    mont_gz = grid_z_for_version(mont_version)
-    cond = qr.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, mont_gz).contiguous()
-    theme = th.to(device)
-    # Per-species mean attributes — a "typical" tree of each species at this
-    # version. A global mid-value like 0.5 sits outside most species' attr
-    # distribution (palm height ≈ 1.0, maple fullness ≈ 0.2) and skews shapes.
-    from qrbloom.treegen import attr_means
-    attr = torch.tensor([attr_means(DS_THEMES[int(t)], mont_version)
-                         for t in th], dtype=torch.float32, device=device)
-    # All montage samples share the same QR version so we pass a scalar-broadcast.
-    ver = torch.full((th.size(0),), int(mont_version), device=device, dtype=torch.long)
-    with torch.no_grad():
-        x = diff.sample(m_eval, cond, theme, attr=attr, steps=SAMPLE_STEPS,
-                        device=device, eta=1.0, version=ver).cpu().numpy()
-    occ = (x[:, 3] > 0)
-    qr_np = qr_u8.numpy()
-    qr_mask = (qr_np > 0)[:, :, :, None]
-    occ = occ & np.broadcast_to(qr_mask, occ.shape)
-    rgb = x[:, :3]
-    th_np = th.numpy()
-    render_montage(occ, rgb, qr_np, th_np, png_path)
-    if json_path is not None:
-        save_epoch_json(ep, occ.astype(np.float32), rgb, qr_np, th_np, json_path,
-                        version=mont_version)
-    del m_eval
-    torch.cuda.empty_cache()
-
-
-def main():
-    if IS_MAIN:
-        CKPT_DIR.mkdir(parents=True, exist_ok=True)
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
-    if IS_DIST:
-        dist.barrier()
-
-    # Training samples are generated live; validation uses a fixed seed for reproducibility.
-    train_ds = LiveTreeDataset(EPOCH_SIZE, versions=QR_VERSIONS, deterministic=False,
-                                weights=QR_VERSION_WEIGHTS, batch=BATCH)
-    val_ds = LiveTreeDataset(VAL_SIZE, versions=QR_VERSIONS_VAL, deterministic=True, seed=999,
-                             batch=BATCH)
-    _w_sum = sum(QR_VERSION_WEIGHTS) or 1.0
-    _w_pct = [f"v{v}:{100*w/_w_sum:.0f}%" for v, w in zip(QR_VERSIONS, QR_VERSION_WEIGHTS)]
-    log(f"[data] live generation — epoch_size={EPOCH_SIZE} val={VAL_SIZE}  "
-        f"train_versions={QR_VERSIONS}  val_versions={QR_VERSIONS_VAL}  "
-        f"max_xy={MAX_XY}  max_z={MAX_Z}")
-    log(f"[data] train weights — {' '.join(_w_pct)}  (raw={QR_VERSION_WEIGHTS})")
-
-    # Bucketed batching: block samplers keep every batch single-version.
-    train_sampler = BlockBatchSampler(len(train_ds), BATCH, world=WORLD_SIZE,
-                                      rank=RANK, shuffle=True, seed=SEED)
-    val_sampler = BlockBatchSampler(len(val_ds), BATCH, world=WORLD_SIZE,
-                                    rank=RANK, shuffle=False)
-
-    _dl_kw = dict(num_workers=WORKERS, pin_memory=True, collate_fn=pad_collate)
-    if WORKERS > 0:
-        _dl_kw.update(persistent_workers=True, prefetch_factor=4)
-    train_dl = DataLoader(train_ds, batch_sampler=train_sampler, **_dl_kw)
-    val_dl = DataLoader(val_ds, batch_sampler=val_sampler, **_dl_kw)
-    log(f"[loader] steps/epoch(per-rank)={len(train_dl)}  val batches(per-rank)={len(val_dl)}  "
-        f"workers={WORKERS}  amp={AMP_DTYPE}  world={WORLD_SIZE}  batch/gpu={BATCH}  "
-        f"global_batch={BATCH * WORLD_SIZE}")
-
-    # Build 9 unseen QR codes (one per theme) for the per-epoch sample montage.
-    # Versions are sampled from QR_VERSIONS_VAL so the montage exercises the
-    # multi-version code path. All 9 codes share the SAME version per epoch so
-    # they stack into one batch tensor.
-    mont_batch = None
-    mont_version = None
-    if IS_MAIN:
-        import segno
+        All 9 codes share the SAME version so they stack into one batch
+        tensor; the version comes from cfg.mont_version or a seeded pick.
+        """
+        self.mont_batch = None
+        self.mont_version = None
+        if not self.is_main:
+            return
         import random
         import string
+
+        import segno
+        cfg = self.cfg
         rng = random.Random(20260520)
         url_chars = string.ascii_lowercase + string.digits + "-."
         alnum_chars = string.ascii_letters + string.digits
-        PORTFOLIO_URL = os.environ.get("DEMO_URL", "https://example.com")
-        # Pick a version (rotates each restart via the seed); the same version
-        # is used for all 9 montage samples. MONT_VERSION pins it explicitly —
-        # useful to keep an eye on the riskiest version in multi-version runs.
-        _mv = os.environ.get("MONT_VERSION", "").strip()
-        mont_version = int(_mv) if _mv else \
-            QR_VERSIONS_VAL[rng.randint(0, len(QR_VERSIONS_VAL) - 1)]
+        mont_version = cfg.mont_version if cfg.mont_version is not None else \
+            cfg.versions_val[rng.randint(0, len(cfg.versions_val) - 1)]
         m_qe = qr_modules(mont_version)
         m_gxy = grid_xy_for_version(mont_version)
-        m_gz  = grid_z_for_version(mont_version)
+        m_gz = grid_z_for_version(mont_version)
         m_off = (m_gxy - m_qe) // 2
 
         unseen_qrs, unseen_texts = [], []
         for t in range(9):
             if mont_version >= 3 and t == 5:
-                text = PORTFOLIO_URL
+                text = cfg.demo_url
             else:
                 while True:
                     if mont_version == 1:
@@ -673,20 +326,16 @@ def main():
             pad[m_off:m_off + m_qe, m_off:m_off + m_qe] = core
             unseen_qrs.append(pad)
             unseen_texts.append(text)
-        unseen_qrs = np.stack(unseen_qrs)
-        mont_batch = (
-            torch.zeros(9, m_gxy, m_gxy, m_gz, dtype=torch.uint8),
-            torch.zeros(9, 3, m_gxy, m_gxy, m_gz, dtype=torch.uint8),
-            torch.from_numpy(unseen_qrs),
-            torch.arange(9, dtype=torch.long),
-        )
-        log(f"[montage] unseen QRs (version={mont_version}, "
-            f"grid={m_gxy}x{m_gxy}x{m_gz}) — texts: {unseen_texts}")
+        self.mont_version = mont_version
+        self.mont_batch = (torch.from_numpy(np.stack(unseen_qrs)),
+                           torch.arange(9, dtype=torch.long))
+        self.log(f"[montage] unseen QRs (version={mont_version}, "
+                 f"grid={m_gxy}x{m_gxy}x{m_gz}) — texts: {unseen_texts}")
 
         from qrbloom.treegen import generate_voxels
         gt_samples = []
         for i in range(9):
-            theme_name = DS_THEMES[i]
+            theme_name = THEME_NAMES[i]
             qr = segno.make(unseen_texts[i], error="m", version=mont_version)
             core_bool = [[bool(c) for c in row] for row in qr.matrix]
             voxels = generate_voxels(core_bool, theme=theme_name)
@@ -695,186 +344,313 @@ def main():
             gt_samples.append({"theme": theme_name, "text": unseen_texts[i],
                                "version": mont_version,
                                "cells": cells, "count": len(cells)})
-        with open(str(OUT_DIR / f"unseen_gt{SUFFIX}.json"), "w") as f:
-            _json.dump({"version": mont_version,
-                        "trained_versions": sorted(set(QR_VERSIONS)),
-                        "val_versions": sorted(set(QR_VERSIONS_VAL)),
-                        "samples": gt_samples}, f)
-        log("[montage] saved ground-truth JSON")
+        with open(cfg.out_dir / f"unseen_gt{cfg.variant}.json", "w") as f:
+            json.dump({"version": mont_version,
+                       "trained_versions": sorted(set(cfg.versions)),
+                       "val_versions": sorted(set(cfg.versions_val)),
+                       "samples": gt_samples}, f)
+        self.log("[montage] saved ground-truth JSON")
 
-    # ─── Model ────────────────────────────────────────────────────────────────
-    base_model = DiT3D(dim=DIT_DIM, depth=DIT_DEPTH, heads=DIT_HEADS,
-                       patch=DIT_PATCH, n_themes=len(DS_THEMES),
-                       grad_checkpoint=DIT_CKPT).to(DEVICE)
-    n_params = sum(p.numel() for p in base_model.parameters())
-    log(f"[model] DiT3D params={n_params/1e6:.2f}M  "
-        f"dim={DIT_DIM} depth={DIT_DEPTH} heads={DIT_HEADS} patch={DIT_PATCH}")
-    if INIT_FROM and not CKPT.exists():
-        ck0 = torch.load(INIT_FROM, map_location=DEVICE, weights_only=False)
-        src = ck0.get("ema") or ck0.get("model")
-        missing, unexpected = base_model.load_state_dict(src, strict=False)
-        log(f"[init] warm start from {INIT_FROM} (epoch {ck0.get('epoch', '?')})  "
-            f"missing={len(missing)} unexpected={len(unexpected)}")
-    diff = Diffusion(T=T, device=DEVICE)
-    ema = EMA(base_model, decay=0.999)
+    def _build_backbone(self) -> DiT3D:
+        cfg = self.cfg
+        return DiT3D(dim=cfg.dit_dim, depth=cfg.dit_depth, heads=cfg.dit_heads,
+                     patch=cfg.dit_patch, n_themes=len(THEME_NAMES),
+                     grad_checkpoint=cfg.dit_grad_checkpoint).to(self.device)
 
-    if IS_DIST:
-        model = DDP(base_model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
-    else:
-        model = base_model
+    def _setup_model(self):
+        cfg = self.cfg
+        self.base_model = self._build_backbone()
+        n_params = sum(p.numel() for p in self.base_model.parameters())
+        self.log(f"[model] DiT3D params={n_params / 1e6:.2f}M  "
+                 f"dim={cfg.dit_dim} depth={cfg.dit_depth} "
+                 f"heads={cfg.dit_heads} patch={cfg.dit_patch}")
+        if cfg.init_from and not cfg.ckpt.exists():
+            ck0 = torch.load(cfg.init_from, map_location=self.device,
+                             weights_only=False)
+            src = ck0.get("ema") or ck0.get("model")
+            missing, unexpected = self.base_model.load_state_dict(src, strict=False)
+            self.log(f"[init] warm start from {cfg.init_from} "
+                     f"(epoch {ck0.get('epoch', '?')})  "
+                     f"missing={len(missing)} unexpected={len(unexpected)}")
+        self.diff = Diffusion(T=cfg.timesteps, device=self.device)
+        self.ema = EMA(self.base_model, decay=0.999)
 
-    if COMPILE:
-        log("[compile] torch.compile(mode='reduce-overhead')")
-        model = torch.compile(model, mode="reduce-overhead", dynamic=False)
+        self.model = (DDP(self.base_model, device_ids=[self.local_rank],
+                          output_device=self.local_rank)
+                      if self.is_dist else self.base_model)
+        if cfg.compile:
+            self.log("[compile] torch.compile(mode='reduce-overhead')")
+            self.model = torch.compile(self.model, mode="reduce-overhead",
+                                       dynamic=False)
+        self.opt = torch.optim.Adam(self.base_model.parameters(), lr=cfg.lr)
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=(cfg.amp_th is torch.float16))
 
-    opt = torch.optim.Adam(base_model.parameters(), lr=BASE_LR)
-    scaler = torch.amp.GradScaler("cuda", enabled=(_AMP_TH is torch.float16))
-
-    def lr_at(step: int, total_steps: int):
-        from math import cos, pi
-        return BASE_LR * 0.5 * (1 + cos(pi * step / max(total_steps, 1)))
-
-    # ─── Resume ───────────────────────────────────────────────────────────────
-    start_epoch = 1
-    hist = []
-    best_val = float("inf")
-    if CKPT.exists():
-        ck = torch.load(CKPT, map_location=DEVICE, weights_only=False)
-        base_model.load_state_dict(ck["model"])
-        ema.shadow = {k: v.to(DEVICE) for k, v in ck["ema"].items()}
-        opt.load_state_dict(ck["opt"])
-        if "scaler" in ck and scaler.is_enabled():
+    def _resume(self):
+        cfg = self.cfg
+        self.start_epoch = 1
+        self.hist: list[dict] = []
+        self.best_val = float("inf")
+        if not cfg.ckpt.exists():
+            self.log("[init] no checkpoint found, training from scratch")
+            return
+        ck = torch.load(cfg.ckpt, map_location=self.device, weights_only=False)
+        self.base_model.load_state_dict(ck["model"])
+        self.ema.shadow = {k: v.to(self.device) for k, v in ck["ema"].items()}
+        self.opt.load_state_dict(ck["opt"])
+        if "scaler" in ck and self.scaler.is_enabled():
             try:
-                scaler.load_state_dict(ck["scaler"])
+                self.scaler.load_state_dict(ck["scaler"])
             except Exception:
                 pass
-        start_epoch = ck["epoch"] + 1
-        hist = ck["hist"]
-        if not RESET_BEST:
+        self.start_epoch = ck["epoch"] + 1
+        self.hist = ck["hist"]
+        if not cfg.reset_best:
             if "best_val" in ck:
-                best_val = ck["best_val"]
-            elif hist:
-                vals = [h.get("val_total") for h in hist if h.get("val_total") is not None]
+                self.best_val = ck["best_val"]
+            elif self.hist:
+                vals = [h.get("val_total") for h in self.hist
+                        if h.get("val_total") is not None]
                 if vals:
-                    best_val = min(vals)
-        log(f"[resume] epoch {ck['epoch']} -> start epoch {start_epoch}  best_val={best_val:.4f}")
-    else:
-        log("[init] no checkpoint found, training from scratch")
+                    self.best_val = min(vals)
+        self.log(f"[resume] epoch {ck['epoch']} -> start epoch {self.start_epoch}  "
+                 f"best_val={self.best_val:.4f}")
 
-    total_steps = EPOCHS * len(train_dl)
-    cur_step = (start_epoch - 1) * len(train_dl)
+    # ── run ──────────────────────────────────────────────────────────────
+    def _lr_at(self, step: int, total_steps: int) -> float:
+        return self.cfg.lr * 0.5 * (1 + math.cos(math.pi * step / max(total_steps, 1)))
 
-    # ─── Training loop ────────────────────────────────────────────────────────
-    for ep in range(start_epoch, EPOCHS + 1):
-        if train_sampler is not None:
-            train_sampler.set_epoch(ep)
-        model.train()
-        epoch_parts = {k: 0.0 for k in LOSS_KEYS}
-        epoch_parts["total"] = 0.0
-        pbar = tqdm(train_dl, desc=f"ep{ep:03d}", dynamic_ncols=True, disable=not IS_MAIN)
+    def fit(self):
+        cfg = self.cfg
+        total_steps = cfg.epochs * len(self.train_dl)
+        cur_step = (self.start_epoch - 1) * len(self.train_dl)
+
+        for ep in range(self.start_epoch, cfg.epochs + 1):
+            self.train_sampler.set_epoch(ep)
+            parts, lr, cur_step = self._train_epoch(ep, cur_step, total_steps)
+
+            if ep % cfg.val_every == 0 or ep == cfg.epochs:
+                val_metrics = self.validate()
+            else:
+                val_metrics = {"total": float("inf"), "iou": 0.0,
+                               **{k: 0.0 for k in LOSS_KEYS}}
+            pv = "  ".join(f"v{v}={val_metrics[f'v{v}']:.4f}"
+                           for v in sorted(set(cfg.versions_val))
+                           if f"v{v}" in val_metrics)
+            self.log(f"[ep{ep:03d}] train_total={parts['total']:.4f}  "
+                     f"val_total={val_metrics['total']:.4f}  "
+                     f"val_iou={val_metrics['iou']:.3f}  "
+                     f"lr={lr:.2e}" + (f"  |  {pv}" if pv else ""))
+            self.log(f"   parts: v_mse={parts['v_mse']:.4f}  "
+                     f"v_rgb={parts['v_rgb']:.4f}  v_occ={parts['v_occ']:.4f}")
+
+            self.hist.append({"epoch": ep, "train": parts,
+                              "val_total": val_metrics["total"],
+                              "val_iou": val_metrics["iou"],
+                              "val_parts": val_metrics, "lr": lr})
+            if self.is_main:
+                self._render_epoch(ep, parts)
+                self._checkpoint(ep, val_metrics)
+            if self.is_dist:
+                dist.barrier()
+
+        if self.is_main:
+            cfg.done_marker.touch()
+            self.log(f"[done] {cfg.epochs} epochs complete. checkpoint: {cfg.ckpt}")
+        if self.is_dist:
+            dist.destroy_process_group()
+
+    def _train_epoch(self, ep: int, cur_step: int, total_steps: int):
+        cfg = self.cfg
+        self.model.train()
+        parts = {k: 0.0 for k in LOSS_KEYS}
+        parts["total"] = 0.0
+        pbar = tqdm(self.train_dl, desc=f"ep{ep:03d}", dynamic_ncols=True,
+                    disable=not self.is_main)
         n_batches = 0
+        lr = self.opt.param_groups[0]["lr"]
         for occ_b, rgb_b, qr_b, th_b, attr_b, ver_b in pbar:
-            lr = lr_at(cur_step, total_steps)
-            for pg in opt.param_groups:
+            lr = self._lr_at(cur_step, total_steps)
+            for pg in self.opt.param_groups:
                 pg["lr"] = lr
 
-            x0, cond = _normalize_batch(occ_b, rgb_b, qr_b, DEVICE)
-            theme = th_b.to(DEVICE, non_blocking=True)
-            attr = attr_b.to(DEVICE, non_blocking=True)
-            ver = ver_b.to(DEVICE, non_blocking=True)
+            x0, cond = _normalize_batch(occ_b, rgb_b, qr_b, self.device)
+            theme = th_b.to(self.device, non_blocking=True)
+            attr = attr_b.to(self.device, non_blocking=True)
+            ver = ver_b.to(self.device, non_blocking=True)
 
-            opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", dtype=_AMP_TH):
-                loss, info = diff.p_losses(model, x0, cond, theme, attr, version=ver)
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(base_model.parameters(), 1.0)
-                scaler.step(opt)
-                scaler.update()
+            self.opt.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", dtype=cfg.amp_th):
+                loss, info = self.diff.p_losses(self.model, x0, cond, theme,
+                                                attr, version=ver)
+            if self.scaler.is_enabled():
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.opt)
+                torch.nn.utils.clip_grad_norm_(self.base_model.parameters(), 1.0)
+                self.scaler.step(self.opt)
+                self.scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(base_model.parameters(), 1.0)
-                opt.step()
-            ema.update(base_model)
+                torch.nn.utils.clip_grad_norm_(self.base_model.parameters(), 1.0)
+                self.opt.step()
+            self.ema.update(self.base_model)
             cur_step += 1
             n_batches += 1
 
             for k, v in info.items():
-                epoch_parts[k] += v.item()
-            epoch_parts["total"] += loss.item()
-            if IS_MAIN and n_batches % 10 == 0:
+                parts[k] += v.item()
+            parts["total"] += loss.item()
+            if self.is_main and n_batches % 10 == 0:
                 pbar.set_postfix(loss=f"{loss.item():.3f}",
                                  v_rgb=f"{info['v_rgb'].item():.3f}",
                                  v_occ=f"{info['v_occ'].item():.3f}")
 
-        for k in epoch_parts:
-            epoch_parts[k] /= max(n_batches, 1)
-        if IS_DIST:
+        for k in parts:
+            parts[k] /= max(n_batches, 1)
+        if self.is_dist:
             keys = LOSS_KEYS + ("total",)
-            buf = torch.tensor([epoch_parts[k] for k in keys],
-                               device=DEVICE, dtype=torch.float64)
+            buf = torch.tensor([parts[k] for k in keys],
+                               device=self.device, dtype=torch.float64)
             dist.all_reduce(buf, op=dist.ReduceOp.SUM)
-            buf /= WORLD_SIZE
+            buf /= self.world
             for i, k in enumerate(keys):
-                epoch_parts[k] = buf[i].item()
+                parts[k] = buf[i].item()
+        return parts, lr, cur_step
 
-        # ─── Validation ───────────────────────────────────────────────────────
-        if ep % VAL_EVERY == 0 or ep == EPOCHS:
-            val_metrics = evaluate(model, diff, val_dl, DEVICE)
-        else:
-            val_metrics = {"total": float("inf"), "iou": 0.0}
-            for k in LOSS_KEYS:
-                val_metrics[k] = 0.0
-        _pv = "  ".join(f"v{v}={val_metrics[f'v{v}']:.4f}"
-                        for v in sorted(set(QR_VERSIONS_VAL))
-                        if f"v{v}" in val_metrics)
-        log(f"[ep{ep:03d}] train_total={epoch_parts['total']:.4f}  "
-            f"val_total={val_metrics['total']:.4f}  val_iou={val_metrics['iou']:.3f}  "
-            f"lr={lr:.2e}" + (f"  |  {_pv}" if _pv else ""))
-        log(f"   parts: v_mse={epoch_parts['v_mse']:.4f}  "
-            f"v_rgb={epoch_parts['v_rgb']:.4f}  v_occ={epoch_parts['v_occ']:.4f}")
+    def validate(self) -> dict:
+        """Mean losses and occupancy IoU on the validation set.
 
-        hist.append({
-            "epoch": ep,
-            "train": epoch_parts,
-            "val_total": val_metrics["total"],
-            "val_iou": val_metrics["iou"],
-            "val_parts": val_metrics,
-            "lr": lr,
-        })
+        IoU is estimated by injecting low-level noise (t = T/10) and
+        measuring denoising accuracy at that timestep. Per-version mean
+        losses are reported as "v{N}" keys — in multi-version training a
+        single version can collapse while the aggregate mean still looks
+        healthy, so each version is watched separately.
+        """
+        cfg = self.cfg
+        self.model.eval()
+        parts_sum = {k: 0.0 for k in LOSS_KEYS}
+        parts_sum["total"] = 0.0
+        iou_num = iou_den = 0.0
+        n_batches = 0
+        ver_list = sorted(set(cfg.versions_val))
+        ver_loss = {v: 0.0 for v in ver_list}
+        ver_n = {v: 0 for v in ver_list}
+        t_probe = max(1, cfg.timesteps // 10)
+        with torch.no_grad():
+            for occ_u8, rgb_u8, qr_u8, th, attr, ver in self.val_dl:
+                x0, cond = _normalize_batch(occ_u8, rgb_u8, qr_u8, self.device)
+                theme = th.to(self.device, non_blocking=True)
+                attr = attr.to(self.device, non_blocking=True)
+                ver = ver.to(self.device, non_blocking=True)
+                with torch.amp.autocast("cuda", dtype=cfg.amp_th):
+                    loss, info = self.diff.p_losses(self.model, x0, cond,
+                                                    theme, attr, version=ver)
+                for k, v in info.items():
+                    parts_sum[k] += v.item()
+                parts_sum["total"] += loss.item()
+                v0 = int(ver[0].item())          # bucketed batch: one version
+                if v0 in ver_loss:
+                    ver_loss[v0] += loss.item()
+                    ver_n[v0] += 1
+                # Inject fixed small-t noise, recover x0, threshold for IoU.
+                tb = torch.full((x0.size(0),), t_probe, dtype=torch.long,
+                                device=self.device)
+                noise = torch.randn_like(x0)
+                xt = self.diff.q_sample(x0, tb, noise)
+                am = torch.ones(x0.size(0), device=self.device)
+                with torch.amp.autocast("cuda", dtype=cfg.amp_th):
+                    v_pred = _unwrap(self.model)(xt, tb, cond, theme, attr, am, ver)
+                x0_pred = self.diff.x0_from_v(xt, tb, v_pred.float())
+                occ_pred = (x0_pred[:, 3] > 0).float()
+                occ_gt = (x0[:, 3] > 0).float()
+                iou_num += (occ_pred * occ_gt).sum().item()
+                iou_den += (occ_pred + occ_gt - occ_pred * occ_gt).sum().item()
+                n_batches += 1
 
-        # ─── Visualization / checkpointing (rank 0) ───────────────────────────
-        if IS_MAIN:
-            png = str(OUT_DIR / f"epoch_{ep:03d}.png")
-            epoch_json = str(OUT_DIR / f"epoch_{ep:03d}.json")
-            sample_montage(diff, ema, mont_batch, mont_version, ep, png, DEVICE,
-                           json_path=epoch_json)
-            save_loss_curve(hist, str(OUT_DIR / "loss.png"))
-            log(f"ep{ep:03d} loss={epoch_parts['total']:.4f} "
-                f"v_rgb={epoch_parts['v_rgb']:.4f} v_occ={epoch_parts['v_occ']:.4f}")
-            log(f"  -> {png}  {epoch_json}")
+        if self.is_dist:
+            buf = torch.tensor(
+                [parts_sum[k] for k in LOSS_KEYS] + [parts_sum["total"],
+                 iou_num, iou_den, float(n_batches)]
+                + [ver_loss[v] for v in ver_list]
+                + [float(ver_n[v]) for v in ver_list],
+                device=self.device, dtype=torch.float64)
+            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+            vals = buf.tolist()
+            for i, k in enumerate(LOSS_KEYS):
+                parts_sum[k] = vals[i]
+            parts_sum["total"] = vals[len(LOSS_KEYS)]
+            iou_num, iou_den = vals[len(LOSS_KEYS) + 1], vals[len(LOSS_KEYS) + 2]
+            n_batches = max(int(vals[len(LOSS_KEYS) + 3]), 1)
+            off = len(LOSS_KEYS) + 4
+            for i, v in enumerate(ver_list):
+                ver_loss[v] = vals[off + i]
+                ver_n[v] = int(vals[off + len(ver_list) + i])
 
-            if val_metrics["total"] < best_val:
-                best_val = val_metrics["total"]
-                new_best = True
-            else:
-                new_best = False
-            state = {"model": base_model.state_dict(), "ema": ema.shadow,
-                     "opt": opt.state_dict(), "scaler": scaler.state_dict(),
-                     "epoch": ep, "hist": hist, "best_val": best_val}
-            _safe_save(state, CKPT)
-            if new_best:
-                _safe_save(state, CKPT_BEST)
-                log(f"  new best val_total={best_val:.4f}")
-        if IS_DIST:
-            dist.barrier()
+        for k in parts_sum:
+            parts_sum[k] /= max(n_batches, 1)
+        parts_sum["iou"] = iou_num / max(iou_den, 1e-6)
+        for v in ver_list:
+            parts_sum[f"v{v}"] = ver_loss[v] / max(ver_n[v], 1)
+        self.model.train()
+        return parts_sum
 
-    if IS_MAIN:
-        DONE.touch()
-        log(f"[done] {EPOCHS} epochs complete. checkpoint: {CKPT}")
-    if IS_DIST:
-        dist.destroy_process_group()
+    def sample_montage(self, ep: int, png_path: str, json_path: str | None = None):
+        """Sample the EMA model stochastically for each theme; write PNG + JSON."""
+        cfg = self.cfg
+        m_eval = self._build_backbone()
+        self.ema.copy_to(m_eval)
+        m_eval.eval()
+        qr_u8, th = self.mont_batch
+        qr = qr_u8.float().to(self.device)
+        mont_gz = grid_z_for_version(self.mont_version)
+        cond = qr.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, mont_gz).contiguous()
+        theme = th.to(self.device)
+        # Per-species mean attributes — a "typical" tree of each species at
+        # this version (a global 0.5 sits outside most species' attr range).
+        attr = torch.tensor([attr_means(THEME_NAMES[int(t)], self.mont_version)
+                             for t in th], dtype=torch.float32, device=self.device)
+        ver = torch.full((th.size(0),), int(self.mont_version),
+                         device=self.device, dtype=torch.long)
+        with torch.no_grad():
+            x = self.diff.sample(m_eval, cond, theme, attr=attr,
+                                 steps=cfg.sample_steps, device=self.device,
+                                 eta=1.0, version=ver).cpu().numpy()
+        occ = (x[:, 3] > 0)
+        qr_np = qr_u8.numpy()
+        occ = occ & np.broadcast_to((qr_np > 0)[:, :, :, None], occ.shape)
+        rgb = x[:, :3]
+        th_np = th.numpy()
+        render_montage(occ, rgb, qr_np, th_np, png_path)
+        if json_path is not None:
+            save_epoch_json(ep, occ.astype(np.float32), rgb, qr_np, th_np,
+                            json_path, version=self.mont_version)
+        del m_eval
+        torch.cuda.empty_cache()
+
+    def _render_epoch(self, ep: int, parts: dict):
+        png = str(self.cfg.out_dir / f"epoch_{ep:03d}.png")
+        epoch_json = str(self.cfg.out_dir / f"epoch_{ep:03d}.json")
+        self.sample_montage(ep, png, epoch_json)
+        save_loss_curve(self.hist, str(self.cfg.out_dir / "loss.png"))
+        self.log(f"ep{ep:03d} loss={parts['total']:.4f} "
+                 f"v_rgb={parts['v_rgb']:.4f} v_occ={parts['v_occ']:.4f}")
+        self.log(f"  -> {png}  {epoch_json}")
+
+    def _checkpoint(self, ep: int, val_metrics: dict):
+        new_best = val_metrics["total"] < self.best_val
+        if new_best:
+            self.best_val = val_metrics["total"]
+        state = {"model": self.base_model.state_dict(), "ema": self.ema.shadow,
+                 "opt": self.opt.state_dict(), "scaler": self.scaler.state_dict(),
+                 "epoch": ep, "hist": self.hist, "best_val": self.best_val}
+        _safe_save(state, self.cfg.ckpt)
+        if new_best:
+            _safe_save(state, self.cfg.ckpt_best)
+            self.log(f"  new best val_total={self.best_val:.4f}")
+
+
+def main():
+    Trainer(TrainConfig.from_env()).fit()
 
 
 if __name__ == "__main__":
