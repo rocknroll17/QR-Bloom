@@ -267,6 +267,16 @@ export class ModelClient {
     return { phase: this.#phase, bytes: this.#bytes, total: this.#total };
   }
 
+  /** Theme list for the UI, sourced from the manifest. */
+  async themes() {
+    return (await this.manifest()).themes;
+  }
+
+  /** Kick off the model download (alias with the ApiClient interface). */
+  async prepare(onProgress) {
+    return this.download(onProgress);
+  }
+
   /** Fetch (once) and return the manifest; prunes stale cached weights. */
   async manifest() {
     if (this.#manifest) return this.#manifest;

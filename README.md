@@ -74,13 +74,17 @@ attributes, so each species is generated at its typical proportions.
 
 ```
 qrbloom/
-  treegen.py     Procedural voxel-tree generator (10 species, per-species
-                 augmentation built in)
+  treegen.py     Procedural voxel-tree generator (SPECIES registry:
+                 palette, proportions, augmentation, shape field)
   qr.py          QR-code generation and voxel-grid sizing helpers
   model.py       DiT3D backbone + v-prediction diffusion process
-train.py         Training entry point (one model, all QR versions)
+  data.py        Live dataset + version-bucketed batch sampler
+  viz.py         Training montages, loss curves, epoch JSON
+train.py         TrainConfig + Trainer (one model, all QR versions)
 evaluate.py      Quantitative evaluation (occupancy, color fidelity, diversity)
-gallery.py       Interactive 3D web viewer (FastAPI)
+gallery.py       Self-hosted demo server (ModelService + REST API)
+docs/            The demo page (GitHub Pages and the gallery serve the same
+                 files; generation backend is chosen at serve time)
 scripts/         Weight export for the in-browser demo
 Makefile         Task shortcuts (train, stop, gallery, status, logs, clean)
 assets/          Demo assets
@@ -160,10 +164,11 @@ Or run directly:
 python gallery.py --port 8000
 ```
 
-Then open `http://localhost:8000`. The gallery is a FastAPI app that renders
-generated trees in 3D and hot-reloads as new checkpoints appear during
-training. Tilt the camera toward top-down and the tree's block colors resolve
-into the scannable QR code.
+Then open `http://localhost:8000`. The gallery serves the same page GitHub
+Pages publishes, with generation switched to its REST API: the server runs
+the checkpoint locally (hot-reloading it as training updates the file), so
+the browser downloads no model. Tilt the camera toward top-down and the
+tree's block colors resolve into the scannable QR code.
 
 ### Local browser demo (WebGPU)
 

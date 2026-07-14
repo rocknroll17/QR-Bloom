@@ -1,31 +1,28 @@
 # SPDX-FileCopyrightText: 2026 rocknroll17
 # SPDX-License-Identifier: MIT
 
-"""gallery — interactive Three.js viewer for QR-Bloom voxel tree outputs.
+"""gallery — self-hosted server for the QR-Bloom demo.
 
-The training script writes per-epoch epoch_***.json files containing
-(occupancy + RGB) voxel data. This server serves them as an interactive 3D
-gallery, and runs live model inference through ModelService.
+Serves the same static page that GitHub Pages publishes (docs/), with one
+difference: the server injects `window.QRBLOOM_API` into the page, which
+switches generation to this server's REST API (ModelService running the
+checkpoint locally) instead of downloading the in-browser model.
 
 Usage: python gallery.py [--port 8000]
 """
 import argparse
 import os
-import re
 import threading
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 import uvicorn
 
-_TMPL_DIR = Path(__file__).resolve().parent / "templates"
-
 ROOT = os.path.dirname(os.path.abspath(__file__))
-RUNS_DIR = os.path.join(ROOT, "runs")
+DOCS_DIR = os.path.join(ROOT, "docs")
 CKPT_DIR = os.path.join(ROOT, "checkpoints")
-LOG = os.path.join(RUNS_DIR, "train.log")
 
 
 class ModelService:
@@ -265,154 +262,52 @@ def list_qr_versions():
             "default": (trained[0] if trained else 1)}
 
 
-def get_state():
-    rgx_png = re.compile(r'epoch_(\d+)\.png$')
-    rgx_json = re.compile(r'epoch_(\d+)\.json$')
-    seen_eps: set = set()
-    seen_json: set = set()
-    scan_dir = RUNS_DIR if os.path.isdir(RUNS_DIR) else ROOT
-    for f in os.listdir(scan_dir):
-        m = rgx_png.match(f)
-        if m:
-            seen_eps.add(int(m.group(1)))
-        m2 = rgx_json.match(f)
-        if m2:
-            seen_json.add(int(m2.group(1)))
-
-    state = {"epochs": sorted(seen_eps), "json_set": sorted(seen_json),
-             "losses": [], "target_epochs": 80}
-
-    if os.path.exists(LOG):
-        try:
-            with open(LOG) as f:
-                txt = f.read()
-            for m in re.finditer(
-                    r'ep(\d+) loss=([\d.]+) occ=([\d.]+) rgb=([\d.]+)', txt):
-                e, t, o, r = m.groups()
-                state["losses"].append({
-                    "ep": int(e), "total": float(t),
-                    "occ": float(o), "rgb": float(r),
-                })
-        except Exception:
-            pass
-
-    try:
-        import torch
-        ck_pair = [
-            (os.path.join(CKPT_DIR, "qrbloom_all.pt"), "latest_ep"),
-            (os.path.join(CKPT_DIR, "qrbloom_all_best.pt"), "best_ep"),
-        ]
-        for path, key in ck_pair:
-            if os.path.exists(path):
-                ck = torch.load(path, map_location="cpu", weights_only=False)
-                state[key] = ck["epoch"]
-    except Exception as e:
-        state["ckpt_err"] = str(e)
-
-    return state
-
-
-def _safe_path_in(base: str, name: str) -> str | None:
-    """Resolve `base/name` and return it only if it stays inside `base`.
-
-    Belt-and-suspenders containment check — the callers already validate
-    `name` against a strict pattern before calling, but resolving with
-    realpath and confirming the result is rooted at `base` makes path
-    injection structurally impossible.
-    """
-    base_real = os.path.realpath(base)
-    full_real = os.path.realpath(os.path.join(base_real, name))
-    try:
-        if os.path.commonpath([base_real, full_real]) == base_real:
-            return full_real
-    except ValueError:
-        # Different drives on Windows, or otherwise incommensurable paths.
-        pass
-    return None
-
-
-def _serve_template(name: str) -> HTMLResponse:
-    """Serve a template with no-store so the browser always gets the latest."""
-    return HTMLResponse(
-        content=(_TMPL_DIR / name).read_text(encoding="utf-8"),
-        headers={"Cache-Control": "no-store, must-revalidate"},
-    )
-
-
 app = FastAPI()
+
+# The page GitHub Pages publishes, with the server-mode flag injected: the
+# page sees window.QRBLOOM_API and generates through this server's REST API
+# instead of downloading the in-browser model.
+_API_FLAG = '<head>\n<script>window.QRBLOOM_API = "/api";</script>'
+
+# The demo's static modules — the exact files GitHub Pages publishes, so
+# both deployments run identical code.
+_DOC_FILES = {
+    "embed.html": "text/html",
+    "qrbloom-viewer.js": "application/javascript",
+    "qrbloom-api-client.js": "application/javascript",
+    "qrbloom-inference.js": "application/javascript",
+    "qrbloom-model.js": "application/javascript",
+}
+
+
+def _serve_page() -> HTMLResponse:
+    html = (Path(DOCS_DIR) / "index.html").read_text(encoding="utf-8")
+    html = html.replace("<head>", _API_FLAG, 1)
+    return HTMLResponse(content=html,
+                        headers={"Cache-Control": "no-store, must-revalidate"})
 
 
 @app.get("/", response_class=HTMLResponse)
 def page_index():
-    return _serve_template("index.html")
+    return _serve_page()
 
 
 @app.get("/index.html", response_class=HTMLResponse)
 def page_index_html():
-    return _serve_template("index.html")
+    return _serve_page()
 
 
-@app.get("/embed-template", response_class=PlainTextResponse)
-def route_embed_template():
-    content = (_TMPL_DIR / "embed.html").read_text(encoding="utf-8")
-    return PlainTextResponse(content=content, headers={"Cache-Control": "no-store"})
-
-
-# Shared 3D viewer — the same file is also published by GitHub Pages, so the
-# gallery and the static demo run identical rendering logic without drift.
-@app.get("/qrbloom-viewer.js")
-def route_viewer_js():
-    content = (Path(ROOT) / "docs" / "qrbloom-viewer.js").read_text(encoding="utf-8")
-    return Response(
-        content=content,
-        media_type="application/javascript",
-        headers={"Cache-Control": "no-store"},
-    )
-
-
-@app.get("/state")
-def route_state():
-    return JSONResponse(content=get_state(), headers={"Cache-Control": "no-store"})
-
-
-# Image and JSON routes reconstruct the requested filename from a regex match
-# group rather than passing user input through; the validated filename is
-# rebuilt from literal strings + an integer parse so no user-controlled byte
-# can survive into the path expression.
-
-@app.get("/img/{name}")
-def route_img(name: str):
-    if name == "loss.png":
-        clean = "loss.png"
-    elif (m := re.fullmatch(r'epoch_(\d+)\.png', name)):
-        # zfill(3) matches train.py's epoch_{N:03d} naming so the lookup hits.
-        clean = f"epoch_{int(m.group(1)):03d}.png"
-    else:
-        return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    full = _safe_path_in(RUNS_DIR, clean) or _safe_path_in(ROOT, clean)
-    if not full or not os.path.exists(full):
-        return Response(content=b"not found", status_code=404, media_type="text/plain")
-    with open(full, "rb") as f:
-        data = f.read()
-    return Response(content=data, media_type="image/png",
-                    headers={"Cache-Control": "no-store"})
-
-
-@app.get("/data/{name}")
-def route_data(name: str):
-    if name == "unseen_gt.json":
-        clean = "unseen_gt.json"
-    elif (m := re.fullmatch(r'ep(\d+)\.json', name)):
-        # zfill(3) matches train.py's epoch_{N:03d} naming so the lookup hits.
-        clean = f"epoch_{int(m.group(1)):03d}.json"
-    else:
-        return Response(content=b"not allowed", status_code=404, media_type="text/plain")
-    full = _safe_path_in(RUNS_DIR, clean) or _safe_path_in(ROOT, clean)
-    if not full or not os.path.exists(full):
-        return Response(content=b"not found", status_code=404, media_type="text/plain")
-    with open(full, "rb") as f:
-        data = f.read()
-    return Response(content=data, media_type="application/json",
+@app.get("/{name}")
+def route_doc_file(name: str):
+    """Serve a whitelisted docs/ file. The name never touches the filesystem
+    unless it is a literal key of _DOC_FILES, so no user-controlled byte can
+    reach the path expression."""
+    media_type = _DOC_FILES.get(name)
+    if media_type is None:
+        return Response(content=b"not found", status_code=404,
+                        media_type="text/plain")
+    content = (Path(DOCS_DIR) / name).read_text(encoding="utf-8")
+    return Response(content=content, media_type=media_type,
                     headers={"Cache-Control": "no-store"})
 
 

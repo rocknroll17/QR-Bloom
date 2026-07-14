@@ -229,9 +229,17 @@
 </script>
 <script type="module">
 import { Viewer } from './qrbloom-viewer.js?v=2';
-import { qrbloom } from './qrbloom-inference.js?v=3';
 
-// Single shared viewer — same rendering code as the home-hosted gallery.
+// Generation backend. A self-hosted gallery injects window.QRBLOOM_API when
+// it serves this page, which switches generation to its REST API — and only
+// then is the API client module even fetched. Without the flag (the static
+// GitHub Pages deployment) the in-browser diffusion stack loads instead, so
+// each mode ships only its own code.
+const client = window.QRBLOOM_API
+  ? new (await import('./qrbloom-api-client.js?v=1')).ApiClient(window.QRBLOOM_API)
+  : (await import('./qrbloom-inference.js?v=3')).qrbloom;
+
+// Single shared viewer — same rendering code in both deployments.
 const viewer = new Viewer(document.body);
 
 let _embedCells = [];
@@ -266,36 +274,37 @@ function setStatus(label, pct) {
     label + ' <span class="pbar"><i style="width:' + p + '%"></i></span> ' + p + '%';
 }
 
-// Generate stays disabled until at least one model is actually downloaded — a
-// transient CDN failure must never leave a clickable button over a fake "Ready".
+// Generate stays disabled until the backend is actually ready — a transient
+// failure must never leave a clickable button over a fake "Ready".
 urlBtn.disabled = true;
 setStatus('Loading model');
 
-// Themes come from the manifest hosted alongside the weights so the UI can
-// never drift from what the trained model knows about.
-qrbloom.manifest().then(m => {
-  for (const th of m.themes) {
+const READY_LABEL = { local: 'Ready · local weights', server: 'Ready · server' };
+
+// Themes come from the backend (manifest or API) so the UI can never drift
+// from what the trained model knows about.
+client.themes().then(themes => {
+  for (const th of themes) {
     const o = document.createElement('option');
     o.value = th.name; o.textContent = th.label;
     urlTheme.appendChild(o);
   }
-  // Kick off the model download after the page is interactive; one weights
-  // file covers every trained QR version.
-  qrbloom.download(() => {
-    const st = qrbloom.state();
+  // Prepare the backend after the page is interactive (in-browser mode
+  // downloads the weights here; server mode is a no-op).
+  return client.prepare(() => {
+    const st = client.state();
     setStatus('Downloading model', st.total ? (st.bytes / st.total) * 100 : 0);
-  }).then(() => {
-    // Gate on actual readiness — only enable Generate if the model really loaded.
-    const st = qrbloom.state();
-    if (st.phase === 'downloaded' || st.phase === 'ready') {
-      urlBtn.disabled = false;
-      setStatus(qrbloom.source() === 'local' ? 'Ready · local weights' : 'Ready');
-    } else {
-      urlBtn.disabled = true;
-      setStatus('Model load failed — reload to retry');
-    }
   });
-}).catch(e => { urlBtn.disabled = true; setStatus('Manifest error: ' + e.message); });
+}).then(() => {
+  const st = client.state();
+  if (st.phase === 'downloaded' || st.phase === 'ready') {
+    urlBtn.disabled = false;
+    setStatus(READY_LABEL[client.source()] || 'Ready');
+  } else {
+    urlBtn.disabled = true;
+    setStatus('Model load failed — reload to retry');
+  }
+}).catch(e => { urlBtn.disabled = true; setStatus('Backend error: ' + e.message); });
 
 async function generateFromUrl() {
   const url = urlIn.value.trim();
@@ -304,19 +313,20 @@ async function generateFromUrl() {
   urlBtn.disabled = true;
   const t0 = performance.now();
   try {
-    const result = await qrbloom.generate({
+    const result = await client.generate({
       url, theme,
       onPhase: (phase, info) => {
         if (phase === 'waiting-download') {
           setStatus('Loading model', info.totalBytes ? (info.downloadedBytes / info.totalBytes) * 100 : 0);
         } else if (phase === 'sampling') {
-          setStatus('Generating', (info.step / info.total) * 100);
+          if (info.total) setStatus('Generating', (info.step / info.total) * 100);
+          else setStatus('Generating…');
         }
       },
     });
     showCells(result.cells);
     copyEmbedBtn.disabled = false;
-    setStatus('Ready');
+    setStatus(READY_LABEL[client.source()] || 'Ready');
   } catch (e) {
     setStatus('Error: ' + e.message);
   } finally {
