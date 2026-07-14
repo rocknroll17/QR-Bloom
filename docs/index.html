@@ -229,8 +229,7 @@
 </script>
 <script type="module">
 import { Viewer } from './qrbloom-viewer.js?v=2';
-import { ensureManifest, downloadModel, generate, getDownloadState, weightsSource }
-  from './qrbloom-inference.js?v=2';
+import { qrbloom } from './qrbloom-inference.js?v=3';
 
 // Single shared viewer — same rendering code as the home-hosted gallery.
 const viewer = new Viewer(document.body);
@@ -274,7 +273,7 @@ setStatus('Loading model');
 
 // Themes come from the manifest hosted alongside the weights so the UI can
 // never drift from what the trained model knows about.
-ensureManifest().then(m => {
+qrbloom.manifest().then(m => {
   for (const th of m.themes) {
     const o = document.createElement('option');
     o.value = th.name; o.textContent = th.label;
@@ -282,15 +281,15 @@ ensureManifest().then(m => {
   }
   // Kick off the model download after the page is interactive; one weights
   // file covers every trained QR version.
-  downloadModel(() => {
-    const st = getDownloadState();
+  qrbloom.download(() => {
+    const st = qrbloom.state();
     setStatus('Downloading model', st.total ? (st.bytes / st.total) * 100 : 0);
   }).then(() => {
     // Gate on actual readiness — only enable Generate if the model really loaded.
-    const st = getDownloadState();
+    const st = qrbloom.state();
     if (st.phase === 'downloaded' || st.phase === 'ready') {
       urlBtn.disabled = false;
-      setStatus(weightsSource() === 'local' ? 'Ready · local weights' : 'Ready');
+      setStatus(qrbloom.source() === 'local' ? 'Ready · local weights' : 'Ready');
     } else {
       urlBtn.disabled = true;
       setStatus('Model load failed — reload to retry');
@@ -305,7 +304,7 @@ async function generateFromUrl() {
   urlBtn.disabled = true;
   const t0 = performance.now();
   try {
-    const result = await generate({
+    const result = await qrbloom.generate({
       url, theme,
       onPhase: (phase, info) => {
         if (phase === 'waiting-download') {

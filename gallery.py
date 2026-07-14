@@ -5,7 +5,7 @@
 
 The training script writes per-epoch epoch_***.json files containing
 (occupancy + RGB) voxel data. This server serves them as an interactive 3D
-gallery: an epoch slider, a theme/sample dropdown, and polling for new epochs.
+gallery, and runs live model inference through ModelService.
 
 Usage: python gallery.py [--port 8000]
 """
@@ -22,117 +22,223 @@ import uvicorn
 
 _TMPL_DIR = Path(__file__).resolve().parent / "templates"
 
-
-def _serve_template(name: str) -> HTMLResponse:
-    """Serve a template with no-store so the browser always gets the latest."""
-    return HTMLResponse(
-        content=(_TMPL_DIR / name).read_text(encoding="utf-8"),
-        headers={"Cache-Control": "no-store, must-revalidate"},
-    )
-
 ROOT = os.path.dirname(os.path.abspath(__file__))
 RUNS_DIR = os.path.join(ROOT, "runs")
 CKPT_DIR = os.path.join(ROOT, "checkpoints")
 LOG = os.path.join(RUNS_DIR, "train.log")
 
-# Model inference state — one DiT3D checkpoint serves every trained QR
-# version (the version enters the net as conditioning). Loaded lazily and
-# hot-reloaded when the checkpoint file changes (live training updates).
-_model_lock = threading.Lock()
-_model_ctx: dict | None = None
 
+class ModelService:
+    """Owns live inference: device selection, lazy checkpoint loading with
+    mtime-based hot-reload (live training updates), the trained-version
+    policy, and URL → viewer-cell-list generation.
 
-def _pick_inference_device():
-    """Pick the CUDA device with the most free VRAM, or fall back to CPU.
-    Override with the GALLERY_DEVICE environment variable.
+    One DiT3D checkpoint serves every trained QR version — the version
+    enters the net as conditioning. torch is imported lazily so serving the
+    static pages never pays the import cost.
     """
-    forced = os.environ.get("GALLERY_DEVICE", "").strip()
-    if forced:
-        return forced
-    try:
+
+    def __init__(self, ckpt_dir: str):
+        self.ckpt_dir = ckpt_dir
+        self._lock = threading.Lock()
+        self._model = None
+        self._diff = None
+        self._device: str | None = None
+        self._mtime: float | None = None
+        self._ck_path: str | None = None
+        self.epoch: int | None = None
+
+    # ── checkpoint / device policy ────────────────────────────────────────
+    def ckpt_path(self) -> str:
+        """Prefers the best-validation file; set GALLERY_USE_LATEST=1 to use
+        the live training snapshot instead."""
+        use_latest = bool(int(os.environ.get("GALLERY_USE_LATEST", "0")))
+        if not use_latest:
+            best = os.path.join(self.ckpt_dir, "qrbloom_all_best.pt")
+            if os.path.exists(best):
+                return best
+        return os.path.join(self.ckpt_dir, "qrbloom_all.pt")
+
+    @staticmethod
+    def _pick_device() -> str:
+        """CUDA device with the most free VRAM, or CPU. Override with the
+        GALLERY_DEVICE environment variable."""
+        forced = os.environ.get("GALLERY_DEVICE", "").strip()
+        if forced:
+            return forced
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return "cpu"
+            candidates = []
+            for i in range(torch.cuda.device_count()):
+                free, _ = torch.cuda.mem_get_info(i)
+                if free > 2 * 1024 ** 3:   # require at least 2 GB headroom
+                    candidates.append((free, i))
+            if candidates:
+                candidates.sort(reverse=True)
+                return f"cuda:{candidates[0][1]}"
+        except Exception:
+            pass
+        return "cpu"
+
+    def trained_versions(self) -> list[int]:
+        """QR versions the model was trained on. The single checkpoint covers
+        all of them; the set itself comes from the QRBLOOM_VERSIONS env
+        (default 2..5, matching the training default)."""
+        if not os.path.exists(self.ckpt_path()):
+            return []
+        raw = os.environ.get("QRBLOOM_VERSIONS", "2,3,4,5")
+        return sorted({int(v) for v in raw.split(",") if v.strip()})
+
+    def pick_version_for_text(self, text: str):
+        """Pick the smallest *trained* QR version that fits `text` and encode it.
+
+        Uses segno's auto-detect (micro-QR disabled — standard codes only).
+        A natural version below the trained range is bumped up to the
+        smallest trained version (re-encoding); above the range raises.
+
+        Returns: (segno QRCode object, version int)
+        """
+        import segno
+        trained = self.trained_versions()
+        if not trained:
+            # No trained set known — fall back to natural picking.
+            qr = segno.make(text or "QR-Bloom", error="m", micro=False)
+            return qr, qr.version
+        tmin, tmax = min(trained), max(trained)
+        natural_qr = segno.make(text or "QR-Bloom", error="m", micro=False)
+        natural_v = natural_qr.version
+        if natural_v > tmax:
+            raise ValueError("Text is too long. Please shorten the input.")
+        chosen = max(natural_v, tmin)
+        if chosen == natural_v:
+            return natural_qr, chosen
+        return segno.make(text or "QR-Bloom", error="m", version=chosen), chosen
+
+    # ── model lifecycle ───────────────────────────────────────────────────
+    def _ensure_loaded(self):
+        """Load the checkpoint, or hot-reload it when the file changed."""
         import torch
-        if not torch.cuda.is_available():
-            return "cpu"
-        candidates = []
-        for i in range(torch.cuda.device_count()):
-            free, _ = torch.cuda.mem_get_info(i)
-            if free > 2 * 1024 ** 3:   # require at least 2 GB headroom
-                candidates.append((free, i))
-        if candidates:
-            candidates.sort(reverse=True)
-            return f"cuda:{candidates[0][1]}"
-    except Exception:
-        pass
-    return "cpu"
+        from qrbloom.model import DiT3D, Diffusion
+        from qrbloom.qr import THEME_NAMES
+
+        ck_path = self.ckpt_path()
+        if not os.path.exists(ck_path):
+            # ValueError (not FileNotFoundError) so the API exception handler
+            # can surface the message without risking that some unrelated
+            # FileNotFoundError from torch / disk I/O leaks a raw path.
+            raise ValueError("No trained model is available.")
+        mtime = os.path.getmtime(os.path.realpath(ck_path))
+        if self._model is not None and self._mtime == mtime and self._ck_path == ck_path:
+            return
+
+        if self._device is None:
+            self._device = self._pick_device()
+        ck = torch.load(ck_path, map_location=self._device, weights_only=False)
+        if self._model is None:
+            self._model = DiT3D(n_themes=len(THEME_NAMES)).to(self._device)
+            self._diff = Diffusion(T=500, device=self._device)
+        self._model.load_state_dict(ck["ema"])
+        self._model.eval()
+        self._mtime = mtime
+        self._ck_path = ck_path
+        self.epoch = ck["epoch"]
+        print(f"[model] loaded ep{self.epoch} on {self._device} ({ck_path})",
+              flush=True)
+
+    # ── generation ────────────────────────────────────────────────────────
+    def generate(self, url: str, theme_name: str, steps: int = 100,
+                 version: int | None = None) -> dict:
+        """Run model inference for a URL and return the viewer cell list.
+
+        Version is picked automatically (smallest trained standard QR that
+        fits the text); pass an explicit `version=N` only for debugging.
+        """
+        import numpy as np
+        import torch
+
+        from qrbloom.qr import grid_xy_for_version, grid_z_for_version, qr_modules
+        from qrbloom.qr import THEME_NAMES
+        from qrbloom.treegen import SPECIES, attr_means
+
+        text = url if url else "QR-Bloom"
+        if version is None:
+            qr, version = self.pick_version_for_text(text)
+        else:
+            import segno
+            try:
+                qr = segno.make(text, error="m", version=version)
+            except Exception as e:
+                raise ValueError("Text doesn't fit in the selected QR version.") from e
+        with self._lock:
+            self._ensure_loaded()
+            core = np.array([[1 if c else 0 for c in row] for row in qr.matrix],
+                            dtype=np.uint8)
+            qe = qr_modules(version)
+            gxy = grid_xy_for_version(version)
+            gz = grid_z_for_version(version)
+            off = (gxy - qe) // 2
+            ctr = qe // 2
+
+            pad = np.zeros((gxy, gxy), dtype=np.uint8)
+            pad[off:off + qe, off:off + qe] = core
+            if theme_name not in SPECIES:
+                theme_name = "cherryblossom"
+            theme_idx = THEME_NAMES.index(theme_name)
+            dev = self._device
+            qr_t = torch.from_numpy(pad).unsqueeze(0).to(dev)
+            cond = qr_t.float().unsqueeze(1).unsqueeze(-1).expand(
+                -1, 1, gxy, gxy, gz).contiguous()
+            th_t = torch.tensor([theme_idx], device=dev).long()
+            # Per-species mean attributes — the in-distribution conditioning
+            # for a typical tree of this species at this version (a global
+            # 0.5 sits outside most species' training attr range).
+            attr = torch.tensor([attr_means(theme_name, version)], device=dev,
+                                dtype=torch.float32)
+            ver_t = torch.tensor([int(version)], device=dev, dtype=torch.long)
+            with torch.no_grad():
+                x0 = self._diff.sample(self._model, cond, th_t, attr=attr,
+                                       steps=steps, device=dev, eta=1.0,
+                                       version=ver_t).cpu().numpy()[0]
+
+        occ = (x0[3] > 0)
+        rgb = x0[:3]
+        sp = SPECIES[theme_name]
+        cells = []
+        for i in range(qe):
+            for j in range(qe):
+                col = sp.qr_dark if bool(core[i, j]) else sp.qr_light
+                cells.append([int(j - ctr), 0, int(i - ctr), 1.0, col])
+        rows, cols, heights = np.where(occ)
+        for i, j, k in zip(rows, cols, heights):
+            if k < 1:
+                continue
+            r = int(np.clip((rgb[0, i, j, k] + 1) * 127.5, 0, 255))
+            g = int(np.clip((rgb[1, i, j, k] + 1) * 127.5, 0, 255))
+            b = int(np.clip((rgb[2, i, j, k] + 1) * 127.5, 0, 255))
+            color = f"#{r:02x}{g:02x}{b:02x}"
+            x = int(j - (off + ctr))
+            z = int(i - (off + ctr))
+            cells.append([x, int(k), z, 1.0, color])
+        return {"cells": cells, "count": len(cells), "theme": theme_name,
+                "url": url, "ckpt_ep": self.epoch, "version": version,
+                "grid_xy": gxy, "grid_z": gz}
 
 
-def _ckpt_path() -> str:
-    """Checkpoint path. Prefers the best-validation file; set
-    GALLERY_USE_LATEST=1 to use the live training snapshot instead."""
-    use_latest = bool(int(os.environ.get("GALLERY_USE_LATEST", "0")))
-    if not use_latest:
-        best = os.path.join(CKPT_DIR, "qrbloom_all_best.pt")
-        if os.path.exists(best):
-            return best
-    return os.path.join(CKPT_DIR, "qrbloom_all.pt")
-
-
-def _load_model():
-    """Load (or hot-reload) the model checkpoint.
-
-    The cached entry is reloaded if the file mtime changes (live training
-    updates). One DiT3D serves every trained QR version.
-    """
-    global _model_ctx
-    import torch
-    import numpy as np
-    from qrbloom.model import DiT3D, Diffusion
-    from qrbloom.qr import THEME_NAMES as _THEMES
-
-    ck_path = _ckpt_path()
-    if not os.path.exists(ck_path):
-        # ValueError (not FileNotFoundError) so the API exception handler can
-        # safely surface the message without risking that some unrelated
-        # FileNotFoundError from torch / disk I/O leaks a raw path.
-        raise ValueError("No trained model is available.")
-    real_path = os.path.realpath(ck_path)
-    mtime = os.path.getmtime(real_path)
-
-    cached = _model_ctx
-    if cached is not None and cached.get("mtime") == mtime and cached.get("ck_path") == ck_path:
-        return cached
-
-    DEVICE = (cached["device"] if cached is not None else _pick_inference_device())
-    ck = torch.load(ck_path, map_location=DEVICE, weights_only=False)
-    if cached is None:
-        m = DiT3D(n_themes=len(_THEMES)).to(DEVICE)
-        diff = Diffusion(T=500, device=DEVICE)
-    else:
-        m = cached["model"]
-        diff = cached["diff"]
-    m.load_state_dict(ck["ema"])
-    m.eval()
-    ctx = {
-        "model": m, "diff": diff, "ep": ck["epoch"], "device": DEVICE, "mtime": mtime,
-        "themes": _THEMES, "np": np, "torch": torch,
-        "ck_path": ck_path,
-    }
-    _model_ctx = ctx
-    print(f"[model] loaded ep{ck['epoch']} on {DEVICE} ({ck_path})", flush=True)
-    return ctx
+service = ModelService(CKPT_DIR)
 
 
 def gt_generate(url: str, theme_name: str, version: int | None = None):
-    """Encode a URL and run procedural treegen.
+    """Encode a URL and run procedural treegen (ground truth, no model).
 
     `version` defaults to None ⇒ the smallest trained version that fits the
-    input (segno's natural pick, bumped up to our min trained version).
-    Pass an explicit integer only for debugging.
+    input. Pass an explicit integer only for debugging.
     """
     from qrbloom.treegen import SPECIES, generate_voxels
     text = url if url else "QR-Bloom"
     if version is None:
-        qr, version = pick_version_for_text(text)
+        qr, version = service.pick_version_for_text(text)
     else:
         import segno
         try:
@@ -151,133 +257,16 @@ def gt_generate(url: str, theme_name: str, version: int | None = None):
             "url": text, "version": version}
 
 
-def model_generate(url: str, theme_name: str, steps: int = 100,
-                   version: int | None = None):
-    """Run model inference for a URL.
-
-    Version is picked automatically by segno (smallest standard QR that
-    fits the text), then bumped up to the model's trained range. Pass an
-    explicit `version=N` only to override for debugging.
-    """
-    from qrbloom.qr import qr_modules, grid_xy_for_version, grid_z_for_version
-    from qrbloom.treegen import SPECIES
-    text = url if url else "QR-Bloom"
-    if version is None:
-        qr, version = pick_version_for_text(text)
-    else:
-        import segno
-        try:
-            qr = segno.make(text, error="m", version=version)
-        except Exception as e:
-            raise ValueError("Text doesn't fit in the selected QR version.") from e
-    ctx = _load_model()
-    np = ctx["np"]
-    torch = ctx["torch"]
-    core = np.array([[1 if c else 0 for c in row] for row in qr.matrix],
-                    dtype=np.uint8)
-    qe = qr_modules(version)
-    gxy = grid_xy_for_version(version)
-    gz  = grid_z_for_version(version)
-    off = (gxy - qe) // 2
-    ctr = qe // 2
-
-    pad = np.zeros((gxy, gxy), dtype=np.uint8)
-    pad[off:off + qe, off:off + qe] = core
-    if theme_name not in ctx["themes"]:
-        theme_name = "cherryblossom"
-    theme_idx = ctx["themes"].index(theme_name)
-    dev = ctx["device"]
-    qr_t = torch.from_numpy(pad).unsqueeze(0).to(dev)
-    cond = qr_t.float().unsqueeze(1).unsqueeze(-1).expand(
-        -1, 1, gxy, gxy, gz).contiguous()
-    th_t = torch.tensor([theme_idx], device=dev).long()
-    # Per-species mean attributes — the in-distribution conditioning for a
-    # typical tree of this species at this version (a global 0.5 sits outside
-    # most species' training attr range).
-    from qrbloom.treegen import attr_means
-    attr = torch.tensor([attr_means(theme_name, version)], device=dev,
-                        dtype=torch.float32)
-    ver_t = torch.tensor([int(version)], device=dev, dtype=torch.long)
-    with _model_lock, torch.no_grad():
-        x0 = ctx["diff"].sample(ctx["model"], cond, th_t, attr=attr, steps=steps,
-                                device=dev, eta=1.0, version=ver_t).cpu().numpy()[0]
-    occ = (x0[3] > 0)
-    rgb = x0[:3]
-    sp = SPECIES[theme_name]
-    cells = []
-    for i in range(qe):
-        for j in range(qe):
-            col = sp.qr_dark if bool(core[i, j]) else sp.qr_light
-            cells.append([int(j - ctr), 0, int(i - ctr), 1.0, col])
-    rows, cols, heights = np.where(occ)
-    for i, j, k in zip(rows, cols, heights):
-        if k < 1:
-            continue
-        r = int(np.clip((rgb[0, i, j, k] + 1) * 127.5, 0, 255))
-        g = int(np.clip((rgb[1, i, j, k] + 1) * 127.5, 0, 255))
-        b = int(np.clip((rgb[2, i, j, k] + 1) * 127.5, 0, 255))
-        color = f"#{r:02x}{g:02x}{b:02x}"
-        x = int(j - (off + ctr))
-        z = int(i - (off + ctr))
-        cells.append([x, int(k), z, 1.0, color])
-    return {"cells": cells, "count": len(cells), "theme": theme_name,
-            "url": url, "ckpt_ep": ctx["ep"], "version": version,
-            "grid_xy": gxy, "grid_z": gz}
-
-
-def _trained_versions() -> list[int]:
-    """QR versions the model was trained on.
-
-    The single checkpoint covers all of them; the set itself comes from the
-    QRBLOOM_VERSIONS env (default 2..5, matching the training default).
-    """
-    if not os.path.exists(_ckpt_path()):
-        return []
-    raw = os.environ.get("QRBLOOM_VERSIONS", "2,3,4,5")
-    return sorted({int(v) for v in raw.split(",") if v.strip()})
-
-
-def pick_version_for_text(text: str) -> tuple["object", int]:
-    """Pick the smallest *trained* QR version that fits `text` and encode it.
-
-    Uses segno's auto-detect (with micro-QR disabled — we only deal with
-    standard QR codes). If the natural version is below the trained range,
-    we bump up to the smallest trained version (re-encoding at that
-    version). If it's above the trained range, raise ValueError.
-
-    Returns: (segno QRCode object, version int)
-    """
-    import segno
-    trained = _trained_versions()
-    if not trained:
-        # No trained set known — fall back to natural picking
-        qr = segno.make(text or "QR-Bloom", error="m", micro=False)
-        return qr, qr.version
-    tmin, tmax = min(trained), max(trained)
-    # segno picks smallest fitting standard version
-    natural_qr = segno.make(text or "QR-Bloom", error="m", micro=False)
-    natural_v = natural_qr.version
-    if natural_v > tmax:
-        raise ValueError("Text is too long. Please shorten the input.")
-    chosen = max(natural_v, tmin)
-    if chosen == natural_v:
-        return natural_qr, chosen
-    return segno.make(text or "QR-Bloom", error="m", version=chosen), chosen
-
-
 def list_qr_versions():
     """Return basic info about which versions are trained."""
-    trained = _trained_versions()
+    trained = service.trained_versions()
     return {"versions": list(range(1, 11)),
             "trained": trained,
             "default": (trained[0] if trained else 1)}
 
 
-
-
-
 def get_state():
-    rgx_png  = re.compile(r'epoch_(\d+)\.png$')
+    rgx_png = re.compile(r'epoch_(\d+)\.png$')
     rgx_json = re.compile(r'epoch_(\d+)\.json$')
     seen_eps: set = set()
     seen_json: set = set()
@@ -289,10 +278,9 @@ def get_state():
         m2 = rgx_json.match(f)
         if m2:
             seen_json.add(int(m2.group(1)))
-    eps = sorted(seen_eps)
-    json_set = sorted(seen_json)
 
-    state = {"epochs": eps, "json_set": json_set, "losses": [], "target_epochs": 80}
+    state = {"epochs": sorted(seen_eps), "json_set": sorted(seen_json),
+             "losses": [], "target_epochs": 80}
 
     if os.path.exists(LOG):
         try:
@@ -341,6 +329,15 @@ def _safe_path_in(base: str, name: str) -> str | None:
         # Different drives on Windows, or otherwise incommensurable paths.
         pass
     return None
+
+
+def _serve_template(name: str) -> HTMLResponse:
+    """Serve a template with no-store so the browser always gets the latest."""
+    return HTMLResponse(
+        content=(_TMPL_DIR / name).read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store, must-revalidate"},
+    )
+
 
 app = FastAPI()
 
@@ -447,7 +444,7 @@ def route_api_generate(body: _GenerateBody):
     url = (body.url or "").strip()
     theme = body.theme or "cherryblossom"
     try:
-        result = model_generate(url, theme, steps=100, version=body.version)
+        result = service.generate(url, theme, steps=100, version=body.version)
         return JSONResponse(content=result)
     except ValueError as e:
         # ValueError is reserved for deliberate user-facing messages (text
@@ -462,16 +459,6 @@ def route_api_generate(body: _GenerateBody):
         return JSONResponse(
             content={"error": "Generation failed. Please try again."},
             status_code=500)
-
-
-
-
-
-
-# Production demo video page.
-# URL query params: ?start=1&end=80&sample=5&hold=20&xfade=8
-# (hold/xfade units: frames at 30fps)
-
 
 
 def main():
