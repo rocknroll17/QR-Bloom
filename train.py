@@ -41,7 +41,7 @@ from qrbloom.model import DiT3D, Diffusion, EMA, DOWNSCALE
 from qrbloom.qr import (THEME_NAMES as DS_THEMES, random_qr_core,
                         qr_modules, grid_xy_for_version,
                         grid_z_for_version, pad_to_grid)
-from qrbloom.treegen import THEMES as VTHEMES
+from qrbloom.treegen import SPECIES
 from qrbloom.treegen import generate_voxels_aug as generate_voxels, tree_attributes
 import json as _json
 import random as _random
@@ -506,12 +506,12 @@ def save_epoch_json(ep, occ, rgb_pred, qrs_np, theme_np, path, version):
     samples = []
     for idx in range(len(occ)):
         theme = DS_THEMES[int(theme_np[idx])]
-        th = VTHEMES[theme]
+        sp = SPECIES[theme]
         cells = []
         core = qrs_np[idx][off:off + qe, off:off + qe]
         for i in range(qe):
             for j in range(qe):
-                col_hex = th["qr_dark"] if core[i, j] else th["qr_light"]
+                col_hex = sp.qr_dark if core[i, j] else sp.qr_light
                 cells.append([int(j - ctr), 0, int(i - ctr), 1.0, col_hex])
         rs, cs, hs = np.where(occ[idx])
         for r, c, k in zip(rs, cs, hs):

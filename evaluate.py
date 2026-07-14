@@ -21,7 +21,7 @@ import torch
 from qrbloom.model import DiT3D, Diffusion
 from qrbloom.qr import (THEME_NAMES, grid_xy_for_version, grid_z_for_version,
                         qr_modules, random_qr_core)
-from qrbloom.treegen import THEMES, attr_means, generate_voxels
+from qrbloom.treegen import SPECIES, attr_means, generate_voxels
 
 
 def hex2rgb(h):
@@ -31,11 +31,8 @@ def hex2rgb(h):
 
 def theme_palette(theme):
     """Tree color palette (leaves, flowers, trunk) as a (K, 3) float array."""
-    th = THEMES[theme]
-    cols = list(th.get("leaf", []))
-    cols += list(th.get("flower", []))
-    if "trunk" in th:
-        cols.append(th["trunk"])
+    sp = SPECIES[theme]
+    cols = list(sp.leaf) + list(sp.flower) + [sp.trunk]
     return np.array([hex2rgb(c) for c in cols], dtype=np.float64)
 
 

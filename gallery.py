@@ -87,7 +87,6 @@ def _load_model():
     import torch
     import numpy as np
     from qrbloom.model import DiT3D, Diffusion
-    from qrbloom.treegen import THEMES as VTHEMES
     from qrbloom.qr import THEME_NAMES as _THEMES
 
     ck_path = _ckpt_path()
@@ -115,7 +114,7 @@ def _load_model():
     m.eval()
     ctx = {
         "model": m, "diff": diff, "ep": ck["epoch"], "device": DEVICE, "mtime": mtime,
-        "themes": _THEMES, "vthemes": VTHEMES, "np": np, "torch": torch,
+        "themes": _THEMES, "np": np, "torch": torch,
         "ck_path": ck_path,
     }
     _model_ctx = ctx
@@ -130,7 +129,7 @@ def gt_generate(url: str, theme_name: str, version: int | None = None):
     input (segno's natural pick, bumped up to our min trained version).
     Pass an explicit integer only for debugging.
     """
-    from qrbloom.treegen import generate_voxels, THEMES as VTHEMES
+    from qrbloom.treegen import SPECIES, generate_voxels
     text = url if url else "QR-Bloom"
     if version is None:
         qr, version = pick_version_for_text(text)
@@ -141,7 +140,7 @@ def gt_generate(url: str, theme_name: str, version: int | None = None):
         except Exception as e:
             raise ValueError("Text doesn't fit in the selected QR version.") from e
     core = [[bool(c) for c in row] for row in qr.matrix]
-    if theme_name not in VTHEMES:
+    if theme_name not in SPECIES:
         theme_name = "cherryblossom"
     voxels = generate_voxels(core, theme=theme_name)
     cells = []
@@ -161,6 +160,7 @@ def model_generate(url: str, theme_name: str, steps: int = 100,
     explicit `version=N` only to override for debugging.
     """
     from qrbloom.qr import qr_modules, grid_xy_for_version, grid_z_for_version
+    from qrbloom.treegen import SPECIES
     text = url if url else "QR-Bloom"
     if version is None:
         qr, version = pick_version_for_text(text)
@@ -203,11 +203,11 @@ def model_generate(url: str, theme_name: str, steps: int = 100,
                                 device=dev, eta=1.0, version=ver_t).cpu().numpy()[0]
     occ = (x0[3] > 0)
     rgb = x0[:3]
-    th_data = ctx["vthemes"][theme_name]
+    sp = SPECIES[theme_name]
     cells = []
     for i in range(qe):
         for j in range(qe):
-            col = th_data["qr_dark"] if bool(core[i, j]) else th_data["qr_light"]
+            col = sp.qr_dark if bool(core[i, j]) else sp.qr_light
             cells.append([int(j - ctr), 0, int(i - ctr), 1.0, col])
     rows, cols, heights = np.where(occ)
     for i, j, k in zip(rows, cols, heights):
@@ -429,11 +429,10 @@ class _GenerateBody(BaseModel):
 @app.get("/api/themes")
 def route_api_themes():
     """Theme list (name, label, QR colors), sourced from the generator so it never drifts."""
-    from qrbloom.treegen import THEMES, LABELS
+    from qrbloom.treegen import SPECIES
     return JSONResponse(content=[
-        {"name": k, "label": LABELS.get(k, k),
-         "dark": v["qr_dark"], "light": v["qr_light"]}
-        for k, v in THEMES.items()
+        {"name": k, "label": sp.label, "dark": sp.qr_dark, "light": sp.qr_light}
+        for k, sp in SPECIES.items()
     ])
 
 
