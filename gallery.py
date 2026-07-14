@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2026 rocknroll17
-# SPDX-License-Identifier: MIT
-
 """gallery — self-hosted server for the QR-Bloom demo.
 
 Serves the same static page that GitHub Pages publishes (docs/), with one

@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2026 rocknroll17
-# SPDX-License-Identifier: MIT
-
 """QR-Bloom training entry point.
 
 Trains the QR-conditioned voxel tree diffusion model (one DiT3D across all

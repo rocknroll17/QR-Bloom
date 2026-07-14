@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2026 rocknroll17
-# SPDX-License-Identifier: MIT
-
 """Live training data for QR-Bloom.
 
 Samples are generated on the fly — a procedural voxel tree grown inside a

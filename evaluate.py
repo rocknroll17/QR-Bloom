@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2026 rocknroll17
-# SPDX-License-Identifier: MIT
-
 """Quantitative evaluation for QR-Bloom.
 
 Measures generated voxel trees against treegen ground truth, per QR version:

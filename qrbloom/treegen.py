@@ -1,26 +1,9 @@
-# SPDX-FileCopyrightText: 2026 Shovith Debnath (Grow-Voxly); ported to Python by rocknroll17
-# SPDX-License-Identifier: LicenseRef-GrowVoxly-NonCommercial
+# Ported from Grow-Voxly by Shovith Debnath, with the author's written
+# permission — NON-COMMERCIAL use only. NOT covered by this repository's MIT
+# license; see THIRD_PARTY_NOTICES.md.
+# https://github.com/Hawkay002/.Grow · https://grow-voxly.vercel.app
 
 """treegen.py — QR-conditioned voxel tree generator (10 species).
-
-Attribution
------------
-The voxel tree-generation algorithm in this file is adapted — ported to
-Python/NumPy — from **Grow-Voxly** by **Shovith Debnath**:
-
-    https://github.com/Hawkay002/.Grow
-    https://grow-voxly.space
-    https://grow-voxly.vercel.app
-
-This port is included **with the permission of the original author**, Shovith
-Debnath, granted for NON-COMMERCIAL use only. It is NOT covered by this
-repository's MIT license (see THIRD_PARTY_NOTICES.md); commercial use requires separate
-permission from the author. The diffusion model trained on this generator's
-output is original work.
-
-Concept origin: the cherry-blossom QR-tree idea originates from Enzo Manuel
-Mangano (reactiive.io, @reactiive_), which inspired Grow-Voxly. QR-Bloom's
-generator contains none of his code — it is an independent implementation.
 
 Design
 ------

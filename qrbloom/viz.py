@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2026 rocknroll17
-# SPDX-License-Identifier: MIT
-
 """Training-run visualization: per-epoch montages, loss curves, and the
 gallery-compatible per-epoch voxel JSON."""
 from __future__ import annotations

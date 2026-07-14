@@ -10,14 +10,9 @@ A QR-conditioned 3D voxel diffusion model. It grows a 3D voxel tree whose
 top-down silhouette is a scannable QR code: viewed from the side it is a tree,
 viewed from above it is a working QR code.
 
-> **Credits.** The voxel tree silhouettes are based on the procedural generator
-> from [Grow-Voxly](https://grow-voxly.space) ([mirror](https://grow-voxly.vercel.app))
-> by Shovith Debnath, used **with his permission for non-commercial use**.
-> QR-Bloom's own contribution is the **diffusion model** that *learns* to generate
-> them as scannable QR codes, plus the in-browser WebGPU inference. The ported
-> generator (`qrbloom/treegen.py`) is **not** covered by this repo's MIT license —
-> see [NOTICE](THIRD_PARTY_NOTICES.md). The original cherry-blossom QR-tree concept is by
-> [Enzo Manuel Mangano](https://reactiive.io) (@reactiive_).
+> **Credits.** Tree shapes are ported from [Grow-Voxly](https://grow-voxly.vercel.app)
+> by Shovith Debnath (with permission, non-commercial — see [NOTICE](THIRD_PARTY_NOTICES.md)).
+> Concept by [Enzo Manuel Mangano](https://reactiive.io).
 
 ### Try it
 

@@ -17,10 +17,8 @@ permission from Shovith Debnath.
 
 Concept origin
 --------------
-The cherry-blossom QR-tree concept originates from **Enzo Manuel Mangano**
-(reactiive.io, @reactiive_), whose work inspired Grow-Voxly. QR-Bloom contains
-none of his code; its generator and diffusion model are independent
-implementations. Credit is given here as a courtesy.
+The cherry-blossom QR-tree idea is by **Enzo Manuel Mangano** (reactiive.io,
+@reactiive_). QR-Bloom contains none of his code; credit is courtesy.
 
 Original work
 -------------

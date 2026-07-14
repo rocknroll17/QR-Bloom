@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2026 rocknroll17
-# SPDX-License-Identifier: MIT
-
 """Publish serving weights to the Hugging Face Hub.
 
 Slims the training checkpoint to what serving needs (EMA weights + epoch —

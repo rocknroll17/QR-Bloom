@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2026 rocknroll17
-# SPDX-License-Identifier: MIT
-
 """Export the multi-version EMA checkpoint to tf.js format.
 
 One DiT3D checkpoint (checkpoints/qrbloom_all_best.pt) serves every trained
