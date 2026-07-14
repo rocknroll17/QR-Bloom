@@ -19,3 +19,7 @@ README.md
 LICENSE
 Dockerfile
 .dockerignore
+
+# Local weight exports and backups — fetched at runtime, never baked in
+docs/assets/
+backups/

@@ -46,15 +46,38 @@ class ModelService:
         self.epoch: int | None = None
 
     # ── checkpoint / device policy ────────────────────────────────────────
-    def ckpt_path(self) -> str:
-        """Prefers the best-validation file; set GALLERY_USE_LATEST=1 to use
-        the live training snapshot instead."""
+    def ckpt_path(self) -> str | None:
+        """Local weight resolution, in priority order: the QRBLOOM_CKPT env
+        (an explicit file), then the checkpoints/ directory — the
+        best-validation file unless GALLERY_USE_LATEST=1. Returns None when
+        nothing local exists; the loader then falls back to the published
+        weights on the Hugging Face Hub."""
+        forced = os.environ.get("QRBLOOM_CKPT", "").strip()
+        if forced:
+            return forced
         use_latest = bool(int(os.environ.get("GALLERY_USE_LATEST", "0")))
         if not use_latest:
             best = os.path.join(self.ckpt_dir, "qrbloom_all_best.pt")
             if os.path.exists(best):
                 return best
-        return os.path.join(self.ckpt_dir, "qrbloom_all.pt")
+        latest = os.path.join(self.ckpt_dir, "qrbloom_all.pt")
+        if os.path.exists(latest):
+            return latest
+        return None
+
+    @staticmethod
+    def _hub_ckpt() -> str:
+        """Download the published serving weights from the Hugging Face Hub.
+        Cached under the huggingface_hub cache dir, so a container restart
+        (with the cache volume mounted) doesn't re-download."""
+        from qrbloom import HUB_REPO
+        repo = os.environ.get("QRBLOOM_HF_REPO", HUB_REPO)
+        try:
+            from huggingface_hub import hf_hub_download
+            return hf_hub_download(repo, "torch/qrbloom_all_best.pt")
+        except Exception as e:
+            raise ValueError(
+                "No local checkpoint and the Hub download failed.") from e
 
     @staticmethod
     def _pick_device() -> str:
@@ -83,8 +106,6 @@ class ModelService:
         """QR versions the model was trained on. The single checkpoint covers
         all of them; the set itself comes from the QRBLOOM_VERSIONS env
         (default 2..5, matching the training default)."""
-        if not os.path.exists(self.ckpt_path()):
-            return []
         raw = os.environ.get("QRBLOOM_VERSIONS", "2,3,4,5")
         return sorted({int(v) for v in raw.split(",") if v.strip()})
 
@@ -120,7 +141,7 @@ class ModelService:
         from qrbloom.model import DiT3D, Diffusion
         from qrbloom.qr import THEME_NAMES
 
-        ck_path = self.ckpt_path()
+        ck_path = self.ckpt_path() or self._hub_ckpt()
         if not os.path.exists(ck_path):
             # ValueError (not FileNotFoundError) so the API exception handler
             # can surface the message without risking that some unrelated

@@ -93,10 +93,12 @@ assets/          Demo assets
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+pip install -e ".[train,serve]"
 ```
 
-Requires Python 3.10+ and a CUDA-capable GPU for training.
+Requires Python 3.10+ and a CUDA-capable GPU for training. The extras split
+by role: `train` (matplotlib, tqdm), `serve` (fastapi, uvicorn,
+huggingface_hub), `dev` (both plus ruff).
 
 ## Usage
 
@@ -205,36 +207,43 @@ Available tags:
 
 The image is public, so no `docker login` is required to pull.
 
-### Run the gallery (CPU)
+### Two images, one Dockerfile
 
-Safe to run alongside training. Mount the local `checkpoints/` directory
-so the gallery can read the trained models:
+The Dockerfile is multi-stage with two targets sharing a torch base layer:
 
 ```bash
-docker run -d \
-    --name qrbloom-gallery \
+docker build --target serve -t qrbloom:serve .   # demo server (default target)
+docker build --target train -t qrbloom:train .   # training
+```
+
+### Run the demo server
+
+Requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+for GPU inference (drop `--gpus all` and set `-e GALLERY_DEVICE=cpu` to run
+on CPU). Weights resolve automatically at startup, in priority order: the
+`QRBLOOM_CKPT` env (an explicit file) → a mounted `checkpoints/` directory
+→ the published weights on the Hugging Face Hub (cached in the volume, so
+restarts don't re-download):
+
+```bash
+docker run -d --gpus all \
+    --name qrbloom \
     --restart unless-stopped \
     -p 8000:8000 \
+    -v qrbloom-hf-cache:/root/.cache/huggingface \
+    ghcr.io/rocknroll17/qr-bloom:latest
+```
+
+Serve your own checkpoint instead by mounting it:
+
+```bash
+docker run -d --gpus all -p 8000:8000 \
     -v "$(pwd)/checkpoints:/app/checkpoints:ro" \
-    -e GALLERY_DEVICE=cpu \
     ghcr.io/rocknroll17/qr-bloom:latest
 ```
 
 Then open `http://localhost:8000`. Use a different host port with
 `-p 9000:8000`.
-
-### Run the gallery (GPU)
-
-Requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html):
-
-```bash
-docker run -d --gpus all \
-    --name qrbloom-gallery \
-    --restart unless-stopped \
-    -p 8000:8000 \
-    -v "$(pwd)/checkpoints:/app/checkpoints:ro" \
-    ghcr.io/rocknroll17/qr-bloom:latest
-```
 
 ### Train inside the container
 
@@ -246,8 +255,7 @@ docker run --rm --gpus all \
     -v "$(pwd):/app" \
     -e VARIANT=_all -e QR_VERSIONS=2,3,4,5 \
     -e BATCH=18 -e EPOCH_SIZE=40000 -e EPOCHS=300 \
-    ghcr.io/rocknroll17/qr-bloom:latest \
-    python train.py
+    qrbloom:train
 ```
 
 ### Stop / update
@@ -261,8 +269,8 @@ docker pull ghcr.io/rocknroll17/qr-bloom:latest        # grab newest build
 ### Build locally instead
 
 ```bash
-docker build -t qrbloom .
-docker run -d -p 8000:8000 -v "$(pwd)/checkpoints:/app/checkpoints:ro" qrbloom
+docker build --target serve -t qrbloom:serve .
+docker run -d -p 8000:8000 -v qrbloom-hf-cache:/root/.cache/huggingface qrbloom:serve
 ```
 
 ## License

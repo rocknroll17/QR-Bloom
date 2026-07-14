@@ -9,7 +9,7 @@ welcome.
 git clone https://github.com/rocknroll17/QR-Bloom.git
 cd QR-Bloom
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 make gallery        # open http://localhost:8000
 ```
 
@@ -26,8 +26,8 @@ You can also run everything in Docker — see the README's Docker section.
 4. **Update docs.** If you change a workflow, CLI flag, or env var, update
    the relevant section in `README.md`. If you change tree generation,
    rendering, or grid sizing, check that existing conventions (cell format,
-   camera presets, isotropic grid scaling) still hold across `qrbloom/`,
-   `templates/`, and `docs/`.
+   camera presets, isotropic grid scaling) still hold across `qrbloom/`
+   and `docs/`.
 
 ## Code style
 
@@ -37,11 +37,12 @@ You can also run everything in Docker — see the README's Docker section.
 
 ## Testing your change
 
-- **Tree generation / grid sizing** — run `make train-v2` for a few epochs
-  and check the `runs_v2/epoch_*.png` previews look sane.
+- **Tree generation / grid sizing** — run `make train` for a few epochs
+  (e.g. `EPOCHS=3 EPOCH_SIZE=2000 make train`) and check the
+  `runs_all/epoch_*.png` previews look sane.
 - **Gallery / UI** — `make gallery` and exercise the change in the browser.
-- **Docker** — `docker build -t qrbloom-dev .` and run it locally; this is
-  what CI builds.
+- **Docker** — `docker build --target serve -t qrbloom-dev .` and run it
+  locally; this is what CI builds.
 
 If you're adding a feature that needs new infrastructure (a new model
 output, a new endpoint, etc.), include a short test plan in the PR
