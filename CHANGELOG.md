@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/rocknroll17/QR-Bloom/compare/v1.4.0...v1.4.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* lowercase Docker image name in release workflow ([#77](https://github.com/rocknroll17/QR-Bloom/issues/77)) ([7fd230e](https://github.com/rocknroll17/QR-Bloom/commit/7fd230e3c6a89d14dbe0577849cb2582a21a1a23))
+
 ## [1.4.0](https://github.com/rocknroll17/QR-Bloom/compare/v1.3.1...v1.4.0) (2026-07-14)
 
 
