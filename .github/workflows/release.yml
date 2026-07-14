@@ -60,12 +60,24 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=latest
 
-      - name: Build and push
+      - name: Build and push (serve)
         uses: docker/build-push-action@v7
         with:
           context: .
+          target: serve
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push (train)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: train
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:train
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

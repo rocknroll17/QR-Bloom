@@ -1,26 +1,9 @@
-# SPDX-FileCopyrightText: 2026 Shovith Debnath (Grow-Voxly); ported to Python by rocknroll17
-# SPDX-License-Identifier: LicenseRef-GrowVoxly-NonCommercial
+# Ported from Grow-Voxly by Shovith Debnath, with the author's written
+# permission — NON-COMMERCIAL use only. NOT covered by this repository's MIT
+# license; see THIRD_PARTY_NOTICES.md.
+# https://github.com/Hawkay002/.Grow · https://grow-voxly.vercel.app
 
 """treegen.py — QR-conditioned voxel tree generator (10 species).
-
-Attribution
------------
-The voxel tree-generation algorithm in this file is adapted — ported to
-Python/NumPy — from **Grow-Voxly** by **Shovith Debnath**:
-
-    https://github.com/Hawkay002/.Grow
-    https://grow-voxly.space
-    https://grow-voxly.vercel.app
-
-This port is included **with the permission of the original author**, Shovith
-Debnath, granted for NON-COMMERCIAL use only. It is NOT covered by this
-repository's MIT license (see THIRD_PARTY_NOTICES.md); commercial use requires separate
-permission from the author. The diffusion model trained on this generator's
-output is original work.
-
-Concept origin: the cherry-blossom QR-tree idea originates from Enzo Manuel
-Mangano (reactiive.io, @reactiive_), which inspired Grow-Voxly. QR-Bloom's
-generator contains none of his code — it is an independent implementation.
 
 Design
 ------
@@ -33,6 +16,9 @@ Design
 
 API
 ---
+SPECIES                            -> {name: Species} registry (single source
+                                      of truth: palette, dims, augmentation,
+                                      shape field)
 build_tree(theme, e, H, npr)       -> (trunk, leaf, flower)  (e,H,e) bool
 generate_voxels(qr, theme, rng)    -> voxel list  (QR plane + tree above)
 """
@@ -40,84 +26,10 @@ from __future__ import annotations
 
 import math
 import random
+from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
-
-
-# ===========================================================================
-# Species data — parameters + palette
-# ===========================================================================
-THEMES = {
-    "cherryblossom": {
-        "density": 0.55, "cluster": 2.5, "qr_dark": "#b61260", "qr_light": "#ffeefd",
-        "trunk": "#331d1b",
-        "leaf": ["#ffb4c9", "#ffa5b9", "#f97e9d", "#ff7690", "#f8ebe3"]},
-    "pine": {
-        "density": 0.50, "cluster": 1.5, "qr_dark": "#01553f", "qr_light": "#e8faf9",
-        "trunk": "#33201a",
-        "leaf": ["#1f4838", "#266f48", "#3d8e74", "#4eb290", "#051918"]},
-    "socotra": {
-        "density": 0.70, "cluster": 3.0, "qr_dark": "#481600", "qr_light": "#fbfff0",
-        "trunk": "#591503",
-        "leaf": ["#204827", "#3d6c48", "#549267", "#266f48", "#172216"]},
-    "maple": {
-        "density": 0.40, "cluster": 2.0, "qr_dark": "#953b0d", "qr_light": "#fbf0e8",
-        "trunk": "#3f2a20",
-        "leaf": ["#a50a0e", "#cb0800", "#df3700", "#e15700", "#ed930d"]},
-    "baobab": {
-        "density": 0.60, "cluster": 2.6, "qr_dark": "#573932", "qr_light": "#f1f5f3",
-        "trunk": "#926a4c",
-        "leaf": ["#28611f", "#41711d", "#3f7523", "#4d7e2d"]},
-    "willow": {
-        "density": 0.40, "cluster": 1.5, "qr_dark": "#355229", "qr_light": "#e8faf9",
-        "trunk": "#41392c",
-        "leaf": ["#899b51", "#9cb06b", "#7a7d49", "#bac17a", "#5c682b"]},
-    "magnolia": {
-        "density": 0.50, "cluster": 2.2, "qr_dark": "#52239b", "qr_light": "#f1fbff",
-        "trunk": "#53453a",
-        "leaf": ["#263216", "#294f26", "#39643b"],
-        "flower": ["#f9f7ff", "#ffeefd", "#fee0ff", "#e9aeff"]},
-    "saguaro_cactus": {
-        "density": 1.0, "cluster": 1.0, "qr_dark": "#1b4f35", "qr_light": "#fff7cb",
-        "trunk": "#1b4f35",
-        "leaf": ["#4ed888", "#29c164", "#119e44", "#197c35"],
-        "flower": ["#ee395a", "#f3767d", "#e51a45"]},
-    "palm": {
-        "density": 1.0, "cluster": 1.0, "qr_dark": "#4a7a3f", "qr_light": "#f0f6ec",
-        "trunk": "#7a5c3c",
-        "leaf": ["#3f8a4f", "#4fa05f", "#62b572", "#357544"]},
-    "acacia": {
-        "density": 0.90, "cluster": 2.0, "qr_dark": "#6b7a38", "qr_light": "#f3f4e6",
-        "trunk": "#5a4632",
-        "leaf": ["#5f8a3a", "#6f9c45", "#7faa52", "#527a32"]},
-}
-
-LABELS = {"cherryblossom": "Cherry Blossom", "pine": "Pine", "socotra": "Dragon Tree",
-          "maple": "Maple", "baobab": "Baobab",
-          "willow": "Willow", "magnolia": "Magnolia",
-          "saguaro_cactus": "Saguaro Cactus", "palm": "Palm", "acacia": "Acacia"}
-
-
-def _th_bn(theme, scale_xy, scale_z):
-    """Returns (trunk_height, search_limit) per species.
-
-    scale_xy drives canopy reach (grows with QR version), scale_z drives
-    trunk height. Z is capped because the voxel grid Z is fixed (32).
-    """
-    fl = math.floor
-    table = {
-        "cherryblossom":  (fl(9 * scale_z), fl(10 * scale_xy)),
-        "pine":           (fl(7 * scale_z), fl(8 * scale_xy)),
-        "socotra":        (fl(7 * scale_z) + fl(5 * scale_z), fl(10 * scale_xy)),
-        "maple":          (fl(7 * scale_z), fl(8 * scale_xy)),
-        "baobab":         (fl(10 * scale_z) + fl(7 * scale_z), fl(8 * scale_xy)),
-        "willow":         (fl(7 * scale_z) + fl(3 * scale_z), fl(10 * scale_xy)),
-        "magnolia":       (fl(7 * scale_z), fl(10 * scale_xy)),
-        "saguaro_cactus": (1, fl(10 * scale_xy)),
-        "palm":           (fl(13 * scale_z), fl(12 * scale_xy)),
-        "acacia":         (fl(9 * scale_z), fl(10 * scale_xy)),
-    }
-    return table[theme]
 
 
 # ===========================================================================
@@ -461,32 +373,119 @@ def _acacia(x, y, z, cyy, th, rad, bnd, cn, core, dens, npr, sc):
     return trunk, leaf, np.zeros_like(trunk)
 
 
-_SPECIES = {
-    "cherryblossom": _cherry, "pine": _pine, "socotra": _socotra, "maple": _maple,
-    "baobab": _baobab, "willow": _willow, "magnolia": _magnolia,
-    "saguaro_cactus": _saguaro_cactus, "palm": _palm, "acacia": _acacia,
+# ===========================================================================
+# Species registry — the single source of truth per species: palette,
+# proportions, augmentation ranges, and the implicit-field shape builder.
+# ===========================================================================
+@dataclass(frozen=True)
+class AugRange:
+    """Augmentation ranges: height / radius / density multipliers and the
+    coordinate-salt magnitude for the cluster noise."""
+    h_lo: float
+    h_hi: float
+    r_lo: float
+    r_hi: float
+    d_lo: float
+    d_hi: float
+    salt: int
+
+
+# Structural species (shape driven by the QR footprint) have no meaningful
+# density variation.
+_STRUCTURAL_AUG = AugRange(0.68, 1.50, 0.72, 1.42, 1.0, 1.0, 0)
+# Palm has the sparsest, thinnest target (long slim trunk + 9 radiating
+# fronds at the top). Wide jitter was making the diffusion model spend its
+# capacity chasing many palm variants and falling into a "trunk only" local
+# minimum at v4/v5. Narrow the variance so the canonical palm shape
+# dominates the training signal.
+_PALM_AUG = AugRange(0.92, 1.08, 0.92, 1.08, 0.85, 1.15, 2)
+_DEFAULT_AUG = AugRange(0.75, 1.42, 0.80, 1.35, 0.65, 1.40, 4)
+
+
+@dataclass(frozen=True)
+class Species:
+    """One tree species.
+
+    dims maps (scale_xy, scale_z) — both grow with the QR version — to
+    (trunk_height, bound): scale_xy drives canopy reach, scale_z drives
+    trunk height.
+    """
+    label: str
+    density: float
+    cluster: float
+    qr_dark: str
+    qr_light: str
+    trunk: str                                        # trunk voxel colour
+    leaf: tuple[str, ...]
+    shape: Callable                                   # implicit-field builder
+    dims: Callable[[float, float], tuple[int, int]]   # -> (trunk_h, bound)
+    aug: AugRange = _DEFAULT_AUG
+    flower: tuple[str, ...] = ()
+
+
+_fl = math.floor
+
+SPECIES: dict[str, Species] = {
+    "cherryblossom": Species(
+        label="Cherry Blossom", density=0.55, cluster=2.5,
+        qr_dark="#b61260", qr_light="#ffeefd", trunk="#331d1b",
+        leaf=("#ffb4c9", "#ffa5b9", "#f97e9d", "#ff7690", "#f8ebe3"),
+        shape=_cherry, dims=lambda sxy, sz: (_fl(9 * sz), _fl(10 * sxy))),
+    "pine": Species(
+        label="Pine", density=0.50, cluster=1.5,
+        qr_dark="#01553f", qr_light="#e8faf9", trunk="#33201a",
+        leaf=("#1f4838", "#266f48", "#3d8e74", "#4eb290", "#051918"),
+        shape=_pine, dims=lambda sxy, sz: (_fl(7 * sz), _fl(8 * sxy))),
+    "socotra": Species(
+        label="Dragon Tree", density=0.70, cluster=3.0,
+        qr_dark="#481600", qr_light="#fbfff0", trunk="#591503",
+        leaf=("#204827", "#3d6c48", "#549267", "#266f48", "#172216"),
+        shape=_socotra, aug=_STRUCTURAL_AUG,
+        dims=lambda sxy, sz: (_fl(7 * sz) + _fl(5 * sz), _fl(10 * sxy))),
+    "maple": Species(
+        label="Maple", density=0.40, cluster=2.0,
+        qr_dark="#953b0d", qr_light="#fbf0e8", trunk="#3f2a20",
+        leaf=("#a50a0e", "#cb0800", "#df3700", "#e15700", "#ed930d"),
+        shape=_maple, dims=lambda sxy, sz: (_fl(7 * sz), _fl(8 * sxy))),
+    "baobab": Species(
+        label="Baobab", density=0.60, cluster=2.6,
+        qr_dark="#573932", qr_light="#f1f5f3", trunk="#926a4c",
+        leaf=("#28611f", "#41711d", "#3f7523", "#4d7e2d"),
+        shape=_baobab, aug=_STRUCTURAL_AUG,
+        dims=lambda sxy, sz: (_fl(10 * sz) + _fl(7 * sz), _fl(8 * sxy))),
+    "willow": Species(
+        label="Willow", density=0.40, cluster=1.5,
+        qr_dark="#355229", qr_light="#e8faf9", trunk="#41392c",
+        leaf=("#899b51", "#9cb06b", "#7a7d49", "#bac17a", "#5c682b"),
+        shape=_willow,
+        dims=lambda sxy, sz: (_fl(7 * sz) + _fl(3 * sz), _fl(10 * sxy))),
+    "magnolia": Species(
+        label="Magnolia", density=0.50, cluster=2.2,
+        qr_dark="#52239b", qr_light="#f1fbff", trunk="#53453a",
+        leaf=("#263216", "#294f26", "#39643b"),
+        flower=("#f9f7ff", "#ffeefd", "#fee0ff", "#e9aeff"),
+        shape=_magnolia, dims=lambda sxy, sz: (_fl(7 * sz), _fl(10 * sxy))),
+    "saguaro_cactus": Species(
+        label="Saguaro Cactus", density=1.0, cluster=1.0,
+        qr_dark="#1b4f35", qr_light="#fff7cb", trunk="#1b4f35",
+        leaf=("#4ed888", "#29c164", "#119e44", "#197c35"),
+        flower=("#ee395a", "#f3767d", "#e51a45"),
+        shape=_saguaro_cactus, aug=_STRUCTURAL_AUG,
+        dims=lambda sxy, sz: (1, _fl(10 * sxy))),
+    "palm": Species(
+        label="Palm", density=1.0, cluster=1.0,
+        qr_dark="#4a7a3f", qr_light="#f0f6ec", trunk="#7a5c3c",
+        leaf=("#3f8a4f", "#4fa05f", "#62b572", "#357544"),
+        shape=_palm, aug=_PALM_AUG,
+        dims=lambda sxy, sz: (_fl(13 * sz), _fl(12 * sxy))),
+    "acacia": Species(
+        label="Acacia", density=0.90, cluster=2.0,
+        qr_dark="#6b7a38", qr_light="#f3f4e6", trunk="#5a4632",
+        leaf=("#5f8a3a", "#6f9c45", "#7faa52", "#527a32"),
+        shape=_acacia, dims=lambda sxy, sz: (_fl(9 * sz), _fl(10 * sxy))),
 }
 
-
-# ===========================================================================
-# Tree build + augmentation
-# ===========================================================================
-# Per-species augmentation ranges — structural species (shape driven by QR footprint) have no meaningful density variation.
-_STRUCTURAL = {"socotra", "baobab", "saguaro_cactus"}
-
-
-def _aug_range(theme):
-    """Returns (h_lo,h_hi, r_lo,r_hi, d_lo,d_hi, salt) — per-species ranges for height, radius, density, and coordinate salt."""
-    if theme in _STRUCTURAL:
-        return (0.68, 1.50, 0.72, 1.42, 1.0, 1.0, 0)
-    if theme == "palm":
-        # Palm has the sparsest, thinnest target (long slim trunk + 9 radiating
-        # fronds at the top). Wide jitter was making the diffusion model spend
-        # its capacity chasing many palm variants and falling into a "trunk
-        # only" local minimum at v4/v5. Narrow the variance so the canonical
-        # palm shape dominates the training signal.
-        return (0.92, 1.08, 0.92, 1.08, 0.85, 1.15, 2)
-    return (0.75, 1.42, 0.80, 1.35, 0.65, 1.40, 4)
+THEME_NAMES = list(SPECIES)
 
 
 def build_tree(theme, e, H, npr, augment=True):
@@ -495,8 +494,7 @@ def build_tree(theme, e, H, npr, augment=True):
     augment=True randomizes height, fullness, radius, and coordinate salt within per-species ranges (for training).
     augment=False uses fixed values, producing the canonical shape (for evaluation / ground truth).
     """
-    theme = theme if theme in _SPECIES else "cherryblossom"
-    spec = THEMES[theme]
+    sp = SPECIES.get(theme, SPECIES["cherryblossom"])
     x, y, z = _axes(e, H)
     # Both XY and Z grow with QR version, but Z grows slightly faster
     # (×1.25) so taller trees look proportional rather than squat in larger
@@ -509,32 +507,32 @@ def build_tree(theme, e, H, npr, augment=True):
     # coordinate salt within per-species ranges. Uses truncated-normal
     # sampling (mean at midpoint, std = range/4) so most trees cluster
     # near the species canonical shape; extreme jitter is rare.
-    h_lo, h_hi, r_lo, r_hi, d_lo, d_hi, salt = _aug_range(theme)
+    a = sp.aug
     if augment:
-        hm = _truncated_normal(npr, h_lo, h_hi)
-        rm = _truncated_normal(npr, r_lo, r_hi)
-        dm = _truncated_normal(npr, d_lo, d_hi)
-        sx = int(round(_truncated_normal(npr, -salt, salt))) if salt else 0
-        sy = int(round(_truncated_normal(npr, -salt, salt))) if salt else 0
-        sz = int(round(_truncated_normal(npr, -salt, salt))) if salt else 0
+        hm = _truncated_normal(npr, a.h_lo, a.h_hi)
+        rm = _truncated_normal(npr, a.r_lo, a.r_hi)
+        dm = _truncated_normal(npr, a.d_lo, a.d_hi)
+        sx = int(round(_truncated_normal(npr, -a.salt, a.salt))) if a.salt else 0
+        sy = int(round(_truncated_normal(npr, -a.salt, a.salt))) if a.salt else 0
+        sz = int(round(_truncated_normal(npr, -a.salt, a.salt))) if a.salt else 0
     else:
         hm = rm = dm = 1.0
         sx = sy = sz = 0
 
     radius = max(2.0, math.floor(5 * scale_xy)) * rm
-    th0, bnd = _th_bn(theme, scale_xy, scale_z)
+    th0, bnd = sp.dims(scale_xy, scale_z)
     # Cap th so the trunk + crown fit inside H. Leave a small headroom for
     # leaves that sit above the trunk tip.
     th = max(1.0, min(th0 * hm, H - 4))
-    dens = spec["density"] * dm
+    dens = sp.density * dm
 
     cyy = y - th
-    cs = spec["cluster"]
+    cs = sp.cluster
     cn = _hash(np.floor(x / cs) + sx, np.floor(y / cs) + sy, np.floor(z / cs) + sz)
     core = np.sqrt(x ** 2 + cyy ** 2 + z ** 2) < radius * 0.4
 
-    return _SPECIES[theme](x, y, z, cyy, th, radius, bnd, cn, core, dens, npr,
-                            scale_xy)
+    return sp.shape(x, y, z, cyy, th, radius, bnd, cn, core, dens, npr,
+                    scale_xy)
 
 
 def _gen(qr, theme, rng, augment):
@@ -546,8 +544,8 @@ def _gen(qr, theme, rng, augment):
     if rng is None:
         rng = random.Random(0)
     npr = np.random.default_rng(rng.randint(0, 2 ** 31 - 1))
-    theme = theme if theme in _SPECIES else "cherryblossom"
-    spec = THEMES[theme]
+    theme = theme if theme in SPECIES else "cherryblossom"
+    sp = SPECIES[theme]
     e = len(qr)
     # H scales isotropically with the QR footprint (qr.grid_z_for_version);
     # legacy callers that pre-date that helper still get sensible behavior
@@ -563,18 +561,18 @@ def _gen(qr, theme, rng, augment):
         m[:, 0, :] = False                    # y=0 is reserved for the QR plane
 
     cx = e // 2
-    leaf_p = spec["leaf"]
-    flower_p = spec.get("flower", leaf_p)
-    qd = spec["qr_dark"]
+    leaf_p = sp.leaf
+    flower_p = sp.flower or sp.leaf
+    qd = sp.qr_dark
     vox = []
     for z in range(e):
         for x in range(e):
-            col = qd if dark[z][x] else spec["qr_light"]
+            col = qd if dark[z][x] else sp.qr_light
             vox.append({"pos": (x - cx, 0, z - cx), "color": col,
                         "qr_color": col, "scale": 1.0, "is_base": True})
     for (x, yy, z) in np.argwhere(trunk):
         vox.append({"pos": (int(x) - cx, int(yy), int(z) - cx),
-                    "color": spec["trunk"], "qr_color": qd,
+                    "color": sp.trunk, "qr_color": qd,
                     "scale": 1.0, "is_base": False})
     for (x, yy, z) in np.argwhere(leaf & ~trunk):
         vox.append({"pos": (int(x) - cx, int(yy), int(z) - cx),
@@ -596,8 +594,6 @@ def generate_voxels_aug(qr, theme="cherryblossom", rng=None):
     """Training mode — applies per-species augmentation (same QR produces a slightly different tree each time)."""
     return _gen(qr, theme, rng, augment=True)
 
-
-THEME_NAMES = list(THEMES)
 
 # Tree attribute measurement — used as attribute signals during training
 # (height / fullness / spread), each normalized to [0, 1].
@@ -630,31 +626,39 @@ def tree_attributes(voxels, qr_side: int | None = None):
     return [min(1.0, max(0.0, a)) for a in (height, fullness, spread)]
 
 
-_ATTR_MEAN_CACHE: dict = {}
+_ATTR_STATS_CACHE: dict = {}
 
 
-def attr_means(theme: str, version: int, n: int = 32, seed: int = 20260713):
-    """Mean [height, fullness, spread] of augmented training trees for
-    (theme, version).
+def attr_stats(theme: str, version: int, n: int = 32, seed: int = 20260713):
+    """Mean/std of [height, fullness, spread] over augmented training trees
+    for (theme, version), as {"mean": [...], "std": [...]}.
 
-    This is the in-distribution conditioning for a "typical" tree of that
-    species at that QR version — attribute distributions differ strongly per
-    species (e.g. palm height ≈ 1.0 vs acacia ≈ 0.5 at v4), so a global
-    mid-value like 0.5 sits outside most species' training range and skews
-    generation. Sampled once per (theme, version) per process and cached.
+    The mean is the in-distribution conditioning for a "typical" tree of
+    that species at that QR version — attribute distributions differ
+    strongly per species (e.g. palm height ≈ 0.64 vs acacia ≈ 0.42 at v4),
+    so a global mid-value like 0.5 sits outside most species' training
+    range and skews generation. The std lets samplers draw varied but
+    still in-distribution attributes. Computed once per (theme, version)
+    per process and cached.
     """
     key = (theme, int(version))
-    hit = _ATTR_MEAN_CACHE.get(key)
+    hit = _ATTR_STATS_CACHE.get(key)
     if hit is not None:
         return hit
     from qrbloom.qr import random_qr_core
     rng = random.Random(seed + version * 101)
     npr = np.random.default_rng(seed + version * 101)
-    acc = np.zeros(3)
-    for _ in range(n):
+    samples = np.zeros((n, 3))
+    for i in range(n):
         core = random_qr_core(npr, version=version)
         vox = _gen(core.tolist(), theme, rng, augment=True)
-        acc += np.array(tree_attributes(vox, qr_side=core.shape[0]))
-    out = [float(round(x, 4)) for x in (acc / n)]
-    _ATTR_MEAN_CACHE[key] = out
+        samples[i] = tree_attributes(vox, qr_side=core.shape[0])
+    out = {"mean": [float(round(x, 4)) for x in samples.mean(axis=0)],
+           "std": [float(round(x, 4)) for x in samples.std(axis=0)]}
+    _ATTR_STATS_CACHE[key] = out
     return out
+
+
+def attr_means(theme: str, version: int) -> list[float]:
+    """Mean training attributes for (theme, version) — see attr_stats."""
+    return attr_stats(theme, version)["mean"]

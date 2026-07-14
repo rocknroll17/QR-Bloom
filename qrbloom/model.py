@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2026 rocknroll17
-# SPDX-License-Identifier: MIT
-
 """QR-Bloom model — DiT3D backbone + v-prediction diffusion process.
 
 One model covers every trained QR version. The denoiser is a diffusion

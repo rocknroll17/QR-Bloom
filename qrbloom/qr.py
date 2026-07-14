@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2026 rocknroll17
-# SPDX-License-Identifier: MIT
-
 """QR-code utilities: random QR generation and version-aware grid helpers.
 
 The diffusion model supports arbitrary QR versions (1..40). XY and Z both
@@ -19,7 +16,7 @@ import string
 import numpy as np
 import segno
 
-from qrbloom.treegen import THEMES
+from qrbloom.treegen import SPECIES
 
 # ---------------------------------------------------------------------------
 # Version-aware constants
@@ -31,7 +28,7 @@ MIN_VERSION = 1
 MAX_VERSION = 40
 DEFAULT_VERSION = 1     # legacy default; tools that want v1 keep working
 
-THEME_NAMES = list(THEMES)
+THEME_NAMES = list(SPECIES)
 
 _ALNUM = list(string.ascii_letters + string.digits)
 
@@ -60,7 +57,7 @@ def grid_z_for_version(version: int) -> int:
     The voxel grid is (grid_xy, grid_xy, grid_z); both dimensions grow with
     the QR version so trees keep their natural proportions instead of
     getting squashed in larger codes. Rounded up to Z_MULTIPLE (= 4) so
-    the U-Net can downsample cleanly.
+    the DiT can patchify cleanly.
     """
     import math as _math
     s = version_scale(version)

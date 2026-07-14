@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2026 rocknroll17
-# SPDX-License-Identifier: MIT
-
 """Export the multi-version EMA checkpoint to tf.js format.
 
 One DiT3D checkpoint (checkpoints/qrbloom_all_best.pt) serves every trained
@@ -29,7 +26,7 @@ import torch
 
 from qrbloom.model import DiT3D, Diffusion, X0_CH, N_THEMES
 from qrbloom.qr import grid_xy_for_version, grid_z_for_version
-from qrbloom.treegen import LABELS, THEMES, attr_means
+from qrbloom.treegen import SPECIES, attr_stats
 
 OUT = "docs/assets"
 os.makedirs(OUT, exist_ok=True)
@@ -86,15 +83,16 @@ with open(f"{OUT}/weights_all.bin", "wb") as f:
 with open(f"{OUT}/manifest_all.json", "w") as f:
     json.dump(manifest, f)
 
-themes = [{"name": k, "label": LABELS.get(k, k),
-           "qr_dark": v["qr_dark"], "qr_light": v["qr_light"],
-           "trunk": v["trunk"], "leaf": v["leaf"],
-           "flower": v.get("flower", [])}
-          for k, v in THEMES.items()]
+themes = [{"name": k, "label": sp.label,
+           "qr_dark": sp.qr_dark, "qr_light": sp.qr_light,
+           "trunk": sp.trunk, "leaf": list(sp.leaf),
+           "flower": list(sp.flower)}
+          for k, sp in SPECIES.items()]
 
-# Per-(theme, version) mean training attributes — the browser conditions
-# generation on these so every species gets its "typical" proportions.
-attrs = {k: {str(v): attr_means(k, v) for v in VERSIONS} for k in THEMES}
+# Per-(theme, version) training attribute stats ({mean, std}) — the browser
+# samples its conditioning from this distribution, so every species gets
+# varied but in-distribution proportions.
+attrs = {k: {str(v): attr_stats(k, v) for v in VERSIONS} for k in SPECIES}
 
 top = {"format_version": 3, "model_type": "qrbloom-dit3d-tfjs",
        "weights": "weights_all.bin", "params": "manifest_all.json",

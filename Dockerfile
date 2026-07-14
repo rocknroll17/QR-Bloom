@@ -1,24 +1,27 @@
 # QR-Bloom — QR-conditioned 3D voxel tree diffusion model
 #
-# Build:
-#   docker build -t qrbloom .
+# Multi-stage: one shared base (torch + qrbloom), two targets.
 #
-# Run the interactive gallery (CPU inference; safe to run alongside training):
-#   docker run -d -p 8000:8000 -v "$(pwd):/app" --name qrbloom-gallery qrbloom
+#   docker build --target serve -t qrbloom:serve .     # demo server (default)
+#   docker build --target train -t qrbloom:train .     # training
 #
-# Run the gallery with GPU inference (requires nvidia-container-toolkit):
-#   docker run -d --gpus all -p 8000:8000 -v "$(pwd):/app" --name qrbloom-gallery qrbloom
+# Serve (weights resolve automatically: QRBLOOM_CKPT env → mounted
+# checkpoints/ → download from the Hugging Face Hub into the cache volume):
+#   docker run -d --gpus all -p 8000:8000 \
+#       -v qrbloom-hf-cache:/root/.cache/huggingface \
+#       --name qrbloom qrbloom:serve
 #
-# Train (one DiT3D model across all QR versions):
+# Serve your own checkpoint instead:
+#   docker run -d --gpus all -p 8000:8000 \
+#       -v "$(pwd)/checkpoints:/app/checkpoints:ro" qrbloom:serve
+#
+# Train (mount the working tree so checkpoints and run dirs land on the host):
 #   docker run --rm --gpus all -v "$(pwd):/app" \
 #       -e VARIANT=_all -e QR_VERSIONS=2,3,4,5 \
 #       -e BATCH=18 -e EPOCH_SIZE=40000 -e EPOCHS=300 \
-#       qrbloom python train.py
-#
-# Override the host port (gallery listens on whatever --port is passed):
-#   docker run -d -p 9000:9000 -v "$(pwd):/app" qrbloom python gallery.py --port 9000
+#       qrbloom:train
 
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 # libgomp1: OpenMP runtime required by the PyTorch / NumPy backends.
 RUN apt-get update \
@@ -27,23 +30,25 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# Install dependencies first so this layer is cached across code changes.
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Project code.
+COPY pyproject.toml ./
 COPY qrbloom/ ./qrbloom/
-COPY templates/ ./templates/
-# docs/ ships in full — gallery.py serves docs/qrbloom-viewer.js at runtime,
-# and copying the whole directory lets any future shared asset land in the
-# image automatically. The Pages-only samples/ folder is gitignored so it
-# never enters the build context.
-COPY docs/ ./docs/
-COPY train.py evaluate.py gallery.py ./
+RUN --mount=type=cache,target=/root/.cache/pip pip install .
 
 ENV PYTHONUNBUFFERED=1
 
-# Default: serve the gallery on port 8000.
-# Train/evaluate require an NVIDIA GPU — override CMD and pass --gpus all.
+
+FROM base AS train
+
+RUN --mount=type=cache,target=/root/.cache/pip pip install ".[train]"
+COPY train.py evaluate.py ./
+CMD ["python", "train.py"]
+
+
+# Last stage = the default image: the demo server on port 8000.
+FROM base AS serve
+
+RUN --mount=type=cache,target=/root/.cache/pip pip install ".[serve]"
+COPY gallery.py ./
+COPY docs/ ./docs/
 EXPOSE 8000
 CMD ["python", "gallery.py", "--port", "8000"]

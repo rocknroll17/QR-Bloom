@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qrbloom"
+version = "0.1.0"
+description = "QR-conditioned 3D voxel tree diffusion (DiT) — trees that scan as QR codes"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "segno",
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+train = [
+    "matplotlib",
+    "tqdm",
+]
+serve = [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "huggingface_hub",
+]
+dev = [
+    "qrbloom[train,serve]",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["qrbloom*"]
