@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://qr-bloom.rocknroll17.com/sitemap.xml
