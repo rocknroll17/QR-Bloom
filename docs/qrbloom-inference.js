@@ -98,7 +98,7 @@ function encodeQR(text, trainedVersions) {
       qr.addData(text);
       qr.make();
       const chosen = Math.max(min, v);
-      if (chosen > max) throw new Error(`text too long for trained range (v${min}..v${max}); needs v${v}`);
+      if (chosen > max) throw new Error('Text is too long. Please shorten the input.');
       // Re-encode at the chosen version if we bumped up.
       const final = qrcode(chosen, 'M');
       final.addData(text);
@@ -390,7 +390,7 @@ export class ModelClient {
     if (this.#net) return this.#net;
     this.#fetchBytes().catch(() => {});
     while (!this.#buf && !this.#net) {
-      if (this.#phase === 'error') throw new Error('model download failed');
+      if (this.#phase === 'error') throw new Error('Model download failed. Please refresh and try again.');
       if (onWait) onWait({ downloadedBytes: this.#bytes, totalBytes: this.#total });
       await _sleep(250);
     }
