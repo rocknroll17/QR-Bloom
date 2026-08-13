@@ -1,4 +1,10 @@
+<div align="center">
+
 # QR-Bloom
+
+**A QR-conditioned 3D voxel diffusion model.**
+It grows a 3D voxel tree whose top-down silhouette is a scannable QR code:
+viewed from the side it is a tree, viewed from above it is a working QR code.
 
 [![CodeQL](https://github.com/rocknroll17/QR-Bloom/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/rocknroll17/QR-Bloom/actions/workflows/codeql.yml)
 [![Pages](https://github.com/rocknroll17/QR-Bloom/actions/workflows/pages.yml/badge.svg?branch=main)](https://github.com/rocknroll17/QR-Bloom/actions/workflows/pages.yml)
@@ -6,68 +12,77 @@
 [![GHCR](https://img.shields.io/badge/ghcr.io-qr--bloom-2ea44f?logo=docker&logoColor=white)](https://github.com/rocknroll17/QR-Bloom/pkgs/container/qr-bloom)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A QR-conditioned 3D voxel diffusion model. It grows a 3D voxel tree whose
-top-down silhouette is a scannable QR code: viewed from the side it is a tree,
-viewed from above it is a working QR code.
+![demo](assets/demo.gif)
+
+**[✨ Live demo →](https://qr-bloom.rocknroll17.com/)**
+
+</div>
+
+Type a URL or short text, pick a theme, and the diffusion model runs right
+in your browser (WebGPU) to grow a fresh voxel tree. Flip to the top-down
+view to scan the QR, or copy a one-line embed of the result. No backend —
+it's a static GitHub Pages site that loads the model weights on the fly.
 
 > **Credits.** Tree shapes are ported from [Grow-Voxly](https://grow-voxly.vercel.app)
 > by Shovith Debnath (with permission, non-commercial — see [NOTICE](THIRD_PARTY_NOTICES.md)).
 > Concept by [Enzo Manuel Mangano](https://reactiive.io).
 
-### Try it
+## Table of contents
 
-- **[Live demo →](https://qr-bloom.rocknroll17.com/)**
-  Type a URL or short text, pick a theme, and the diffusion model runs right
-  in your browser (WebGPU) to grow a fresh voxel tree. Flip to the top-down
-  view to scan the QR, or copy a one-line embed of the result. No backend —
-  it's a static GitHub Pages site that loads the model weights on the fly.
+- [Features](#features)
+- [How it works](#how-it-works)
+- [Repository layout](#repository-layout)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Training](#training)
+  - [Evaluation](#evaluation)
+  - [Interactive gallery](#interactive-gallery)
+  - [Local browser demo (WebGPU)](#local-browser-demo-webgpu)
+- [Docker](#docker)
+- [License](#license)
 
-![demo](assets/demo.gif)
-
-## Overview
+## Features
 
 QR-Bloom is a denoising diffusion model that generates a 4-channel voxel grid
 (RGB + occupancy). The grid size scales with the QR code version — taller
 trees and wider footprints for larger codes. Generation is conditioned on:
 
-- **QR footprint** — a QR code matrix. The model is constrained so that the
+- 📱 **QR footprint** — a QR code matrix. The model is constrained so that the
   tree's top-down projection reproduces the code, keeping it scannable.
-- **Theme** — one of ten tree species: cherry blossom, pine, dragon tree,
+- 🌸 **Theme** — one of ten tree species: cherry blossom, pine, dragon tree,
   maple, baobab, willow, magnolia, saguaro cactus, palm, and acacia.
-- **Shape attributes** — three continuous controls (height, fullness, spread)
-  that let the user dial in the tree's proportions at inference time.
-
-Training data is produced by a procedural voxel-tree generator, so the dataset
-is effectively infinite and is generated on the fly during training — no data
-files are stored on disk.
-
-One model covers all trained QR versions (v2..v5): the QR version enters the
-network as conditioning, batches are bucketed so each batch holds a single
-grid size, and the positional embeddings are computed from the input size.
+- 🎛️ **Shape attributes** — three continuous controls (height, fullness,
+  spread) that let the user dial in the tree's proportions at inference time.
+- ♾️ **Infinite training data** — training data is produced by a procedural
+  voxel-tree generator, so the dataset is effectively infinite and is
+  generated on the fly during training; no data files are stored on disk.
+- 🧩 **One model, all sizes** — one model covers all trained QR versions
+  (v2..v5): the QR version enters the network as conditioning, batches are
+  bucketed so each batch holds a single grid size, and the positional
+  embeddings are computed from the input size.
 
 ## How it works
 
-The denoiser is a **diffusion transformer** (DiT): the voxel grid is split
-into 4×4×4 patches, processed by transformer blocks with adaLN-Zero
-conditioning, and projected back to voxels. Every block runs full global
-attention, so the receptive field spans the entire grid at every layer and
-every QR version — the property that lets one model serve all sizes.
-
-It is trained with **v-prediction**: the network predicts the diffusion `v`
-target rather than the clean sample or the noise directly. Combined with
-stochastic (ancestral) sampling, this lets per-voxel color be drawn from a
-distribution instead of regressed toward a mean — important because foliage
-color is inherently varied, and a deterministic regressor collapses it to a
-single dull average.
-
-The shape attributes are trained with **classifier-free guidance**, so a user
-can push the generator toward taller, fuller, or wider trees at sampling
-time. At inference, every surface conditions on measured per-species mean
-attributes, so each species is generated at its typical proportions.
+- 🧠 **Diffusion transformer (DiT) denoiser** — the voxel grid is split into
+  4×4×4 patches, processed by transformer blocks with adaLN-Zero
+  conditioning, and projected back to voxels. Every block runs full global
+  attention, so the receptive field spans the entire grid at every layer and
+  every QR version — the property that lets one model serve all sizes.
+- 🎯 **v-prediction training** — the network predicts the diffusion `v`
+  target rather than the clean sample or the noise directly. Combined with
+  stochastic (ancestral) sampling, this lets per-voxel color be drawn from a
+  distribution instead of regressed toward a mean — important because foliage
+  color is inherently varied, and a deterministic regressor collapses it to a
+  single dull average.
+- 🧭 **Classifier-free guidance on shape** — the shape attributes are trained
+  with classifier-free guidance, so a user can push the generator toward
+  taller, fuller, or wider trees at sampling time. At inference, every
+  surface conditions on measured per-species mean attributes, so each species
+  is generated at its typical proportions.
 
 ## Repository layout
 
-```
+```text
 qrbloom/
   treegen.py     Procedural voxel-tree generator (SPECIES registry:
                  palette, proportions, augmentation, shape field)
@@ -130,6 +145,7 @@ environment variable. Important ones:
 | `MONT_VERSION`       | random   | Pin the montage QR version             |
 
 Training writes:
+
 - `checkpoints/qrbloom{VARIANT}.pt` — latest checkpoint
 - `checkpoints/qrbloom{VARIANT}_best.pt` — best validation loss
 - `runs{VARIANT}/epoch_{N}.json|.png` — per-epoch previews
@@ -197,6 +213,7 @@ Images are published only when a release is cut (a `v*` tag is pushed),
 so every pull lands on a tagged, changelog-backed build.
 
 Available tags:
+
 - `latest` — most recent release
 - `vX.Y.Z` / `X.Y.Z` / `X.Y` / `X` — stable releases (e.g. `v1.1.3`, `1.1.3`, `1.1`, `1`)
 
