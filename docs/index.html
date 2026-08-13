@@ -242,7 +242,7 @@ import { Viewer } from './qrbloom-viewer.js?v=2';
 // each mode ships only its own code.
 const client = window.QRBLOOM_API
   ? new (await import('./qrbloom-api-client.js?v=1')).ApiClient(window.QRBLOOM_API)
-  : (await import('./qrbloom-inference.js?v=3')).qrbloom;
+  : (await import('./qrbloom-inference.js?v=4')).qrbloom;
 
 // Single shared viewer — same rendering code in both deployments.
 const viewer = new Viewer(document.body);
@@ -284,7 +284,7 @@ function setStatus(label, pct) {
 urlBtn.disabled = true;
 setStatus('Loading model');
 
-const READY_LABEL = { local: 'Ready · local weights', server: 'Ready · server' };
+const READY_LABEL = { local: 'Ready · runs in your browser', server: 'Ready' };
 
 // Themes come from the backend (manifest or API) so the UI can never drift
 // from what the trained model knows about.
@@ -307,13 +307,13 @@ client.themes().then(themes => {
     setStatus(READY_LABEL[client.source()] || 'Ready');
   } else {
     urlBtn.disabled = true;
-    setStatus('Model load failed — reload to retry');
+    setStatus('Failed to load the model — refresh to try again');
   }
-}).catch(e => { urlBtn.disabled = true; setStatus('Backend error: ' + e.message); });
+}).catch(e => { console.error(e); urlBtn.disabled = true; setStatus('Failed to load the model — refresh to try again'); });
 
 async function generateFromUrl() {
   const url = urlIn.value.trim();
-  if (!url) { urlStatus.textContent = 'Please enter a URL.'; return; }
+  if (!url) { urlStatus.textContent = 'Enter a link or text to generate.'; return; }
   const theme = urlTheme.value;
   urlBtn.disabled = true;
   const t0 = performance.now();
@@ -367,13 +367,13 @@ copyEmbedBtn.onclick = async () => {
     const code = `<iframe src="${src}" width="420" height="420" frameborder="0" `
                + `style="border:0;border-radius:10px;overflow:hidden"></iframe>`;
     await navigator.clipboard.writeText(code);
-    copyEmbedBtn.textContent = 'Copied!';
+    copyEmbedBtn.textContent = 'Copied';
     copyEmbedBtn.classList.add('copied');
     setTimeout(() => {
       copyEmbedBtn.textContent = 'Copy embed';
       copyEmbedBtn.classList.remove('copied');
     }, 2200);
-  } catch (e) { alert('Copy failed: ' + e.message); }
+  } catch (e) { alert('Copy failed. Please try again.'); }
 };
 </script>
 </body></html>

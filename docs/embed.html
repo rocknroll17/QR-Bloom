@@ -19,7 +19,7 @@
 </style>
 </head>
 <body>
-<div id="err" style="display:none">Could not load embed.</div>
+<div id="err" style="display:none">Unable to load this embed.</div>
 <button id="toggle" style="display:none" title="Switch between the 3D tree and the scannable QR">QR</button>
 <script type="importmap">
 { "imports": {
@@ -72,7 +72,7 @@ loadCells().then(cells => {
   console.error(e);
   const el = document.getElementById('err');
   el.style.display = 'block';
-  el.textContent = 'Could not load embed: ' + e.message;
+  el.textContent = 'Unable to load this embed.';
 });
 </script>
 </body></html>
