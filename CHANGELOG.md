@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.5.0](https://github.com/rocknroll17/QR-Bloom/compare/v1.4.1...v1.5.0) (2026-08-13)
+
+
+### Features
+
+* **seo:** add meta description, canonical, sitemap.xml, robots.txt ([#79](https://github.com/rocknroll17/QR-Bloom/issues/79)) ([a023314](https://github.com/rocknroll17/QR-Bloom/commit/a0233145385ad3f647a6bc4a19a54c7c5e36dc45))
+* **seo:** add meta description, canonical, sitemap.xml, robots.txt ([#81](https://github.com/rocknroll17/QR-Bloom/issues/81)) ([4e44195](https://github.com/rocknroll17/QR-Bloom/commit/4e44195128e300aca8b16bb9173a110e3e83e105))
+
 ## [1.4.1](https://github.com/rocknroll17/QR-Bloom/compare/v1.4.0...v1.4.1) (2026-07-14)
 
 
